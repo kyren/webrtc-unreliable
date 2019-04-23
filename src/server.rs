@@ -4,12 +4,12 @@ use std::{
     fmt,
     io::{Error as IoError, ErrorKind as IoErrorKind},
     net::SocketAddr,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::BytesMut;
-use futures::{try_ready, Async, Poll};
-use tokio::net::UdpSocket;
+use futures::{try_ready, Async, Poll, Stream};
+use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
@@ -54,6 +54,9 @@ pub struct RtcServer {
     buffer_pool: BufferPool,
     pending_clients: PendingClients,
     connected_clients: ConnectedClients,
+    session_timeout: Duration,
+    last_timeout_check: Instant,
+    timeout_check_timer: Interval,
 }
 
 impl RtcServer {
@@ -61,6 +64,7 @@ impl RtcServer {
         http_listen_addr: SocketAddr,
         udp_listen_addr: SocketAddr,
         public_udp_addr: SocketAddr,
+        session_timeout: Duration,
     ) -> Result<RtcServer, IoError> {
         let crypto = Crypto::init().expect("OpenSSL error");
         let (http_server, incoming_session_stream) = create_http_server(
@@ -80,6 +84,9 @@ impl RtcServer {
             buffer_pool: BufferPool::new(),
             pending_clients: PendingClients::new(),
             connected_clients: ConnectedClients::new(),
+            session_timeout,
+            last_timeout_check: Instant::now(),
+            timeout_check_timer: Interval::new_interval(session_timeout),
         })
     }
 
@@ -154,6 +161,7 @@ impl RtcServer {
                     },
                     PendingClient {
                         server_passwd: incoming_session.server_passwd,
+                        last_activity: Instant::now(),
                     },
                 );
             } else {
@@ -162,6 +170,17 @@ impl RtcServer {
                     "incoming session channel unexpectedly closed",
                 ));
             }
+        }
+
+        self.timeout_check_timer.poll().unwrap();
+        if self.last_timeout_check.elapsed() >= self.session_timeout {
+            let session_timeout = self.session_timeout;
+            self.pending_clients.retain(|_, pending_client| {
+                pending_client.last_activity.elapsed() < session_timeout
+            });
+            self.connected_clients.retain(|_, connected_client| {
+                connected_client.last_activity.elapsed() < session_timeout
+            });
         }
 
         Ok(())
@@ -249,6 +268,7 @@ struct PendingClientKey {
 
 struct PendingClient {
     server_passwd: String,
+    last_activity: Instant,
 }
 
 enum ClientState {
