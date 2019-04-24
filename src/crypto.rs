@@ -7,7 +7,7 @@ use openssl::{
     nid::Nid,
     pkey::{PKey, Private},
     rsa::Rsa,
-    ssl::{SslAcceptor, SslMethod, SslOptions, SslVerifyMode},
+    ssl::{SslAcceptor, SslMethod, SslVerifyMode},
     x509::{X509NameBuilder, X509},
 };
 
@@ -55,8 +55,6 @@ impl Crypto {
         ssl_acceptor_builder.set_verify(SslVerifyMode::NONE);
         ssl_acceptor_builder.set_private_key(&key)?;
         ssl_acceptor_builder.set_certificate(&x509)?;
-        // Rust openssl BIO implementations do not implement the proper ctrls to do MTU querying
-        ssl_acceptor_builder.set_options(SslOptions::NO_QUERY_MTU);
         let ssl_acceptor = ssl_acceptor_builder.build();
 
         Ok(Crypto {

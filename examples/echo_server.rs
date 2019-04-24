@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use clap::{App, Arg};
 use futures::{future, Async, Future};
 use tokio::runtime::Runtime;
@@ -54,8 +56,13 @@ fn main() {
         udp_listen_addr
     };
 
-    let mut rtc_server = RtcServer::new(http_listen_addr, udp_listen_addr, public_udp_addr)
-        .expect("could not start RTC server");
+    let mut rtc_server = RtcServer::new(
+        http_listen_addr,
+        udp_listen_addr,
+        public_udp_addr,
+        Duration::from_secs(10),
+    )
+    .expect("could not start RTC server");
     let mut message_buf = vec![0; 0x10000];
     let mut last_message: Option<RtcMessageResult> = None;
 

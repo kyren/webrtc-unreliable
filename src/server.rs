@@ -2,17 +2,20 @@ use std::{
     collections::{hash_map::Entry as HashMapEntry, HashMap, VecDeque},
     error::Error,
     fmt,
-    io::{Error as IoError, ErrorKind as IoErrorKind},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write},
+    mem,
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
-use bytes::BytesMut;
 use futures::{try_ready, Async, Poll, Stream};
+use log::{info, warn};
+use openssl::ssl::{ErrorCode, HandshakeError, MidHandshakeSslStream, SslAcceptor, SslStream};
 use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
+use crate::pool::{Checkout, Pool};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
 
 #[derive(Debug)]
@@ -49,9 +52,10 @@ pub struct RtcServer {
     udp_socket: UdpSocket,
     http_server: HttpServer,
     incoming_session_stream: IncomingSessionStream,
+    ssl_acceptor: SslAcceptor,
     outgoing_udp: OutgoingUdp,
     incoming_rtc: IncomingRtc,
-    buffer_pool: BufferPool,
+    buffer_pool: Pool<Vec<u8>>,
     pending_clients: PendingClients,
     connected_clients: ConnectedClients,
     session_timeout: Duration,
@@ -66,7 +70,7 @@ impl RtcServer {
         public_udp_addr: SocketAddr,
         session_timeout: Duration,
     ) -> Result<RtcServer, IoError> {
-        let crypto = Crypto::init().expect("OpenSSL error");
+        let crypto = Crypto::init().expect("RtcServer: Could not initialize OpenSSL primitives");
         let (http_server, incoming_session_stream) = create_http_server(
             &http_listen_addr,
             public_udp_addr,
@@ -79,9 +83,10 @@ impl RtcServer {
             udp_socket,
             http_server,
             incoming_session_stream,
+            ssl_acceptor: crypto.ssl_acceptor,
             outgoing_udp: OutgoingUdp::new(),
             incoming_rtc: IncomingRtc::new(),
-            buffer_pool: BufferPool::new(),
+            buffer_pool: Pool::new_unbounded(),
             pending_clients: PendingClients::new(),
             connected_clients: ConnectedClients::new(),
             session_timeout,
@@ -130,7 +135,6 @@ impl RtcServer {
         }
 
         buf[0..message_len].copy_from_slice(&message[..]);
-        self.buffer_pool.restore(message);
 
         Ok(Async::Ready(RtcMessageResult {
             message_len,
@@ -180,6 +184,10 @@ impl RtcServer {
             });
             self.connected_clients.retain(|_, connected_client| {
                 connected_client.last_activity.elapsed() < session_timeout
+                    || match connected_client.ssl_stream {
+                        ClientSslStream::Disconnected => true,
+                        _ => false,
+                    }
             });
         }
 
@@ -188,10 +196,9 @@ impl RtcServer {
 
     fn send_udp(&mut self) -> Poll<(), IoError> {
         while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
-            match self.udp_socket.poll_send_to(&packet, &remote_addr) {
-                Ok(Async::Ready(len)) => {
+            match self.udp_socket.poll_send_to(&packet, &remote_addr)? {
+                Async::Ready(len) => {
                     let packet_len = packet.len();
-                    self.buffer_pool.restore(packet);
                     if len != packet_len {
                         return Err(IoError::new(
                             IoErrorKind::Other,
@@ -199,13 +206,9 @@ impl RtcServer {
                         ));
                     }
                 }
-                Ok(Async::NotReady) => {
+                Async::NotReady => {
                     self.outgoing_udp.push_front((packet, remote_addr));
                     return Ok(Async::NotReady);
-                }
-                Err(err) => {
-                    self.buffer_pool.restore(packet);
-                    return Err(err);
                 }
             }
         }
@@ -214,13 +217,110 @@ impl RtcServer {
     }
 
     fn receive_udp(&mut self) -> Poll<(), IoError> {
-        let mut packet_buffer = self.buffer_pool.acquire();
+        let mut packet_buffer = self.buffer_pool.checkout();
+        packet_buffer.resize(MAX_DGRAM_SIZE, 0);
         let (len, remote_addr) = try_ready!(self.udp_socket.poll_recv_from(&mut packet_buffer));
+        if len > MAX_DGRAM_SIZE {
+            return Err(IoError::new(
+                IoErrorKind::Other,
+                "failed to read entire datagram from socket",
+            ));
+        }
+        packet_buffer.truncate(len);
 
         match self.connected_clients.entry(remote_addr) {
             HashMapEntry::Occupied(mut occupied) => {
-                occupied.get_mut().last_activity = Instant::now();
-                println!("unimplemented -- received UDP packet for active connection");
+                let connected_client = occupied.get_mut();
+                connected_client.last_activity = Instant::now();
+                match mem::replace(
+                    &mut connected_client.ssl_stream,
+                    ClientSslStream::Disconnected,
+                ) {
+                    ClientSslStream::MidHandshake(mut mid_handshake) => {
+                        mid_handshake
+                            .get_mut()
+                            .incoming_udp
+                            .push_back(packet_buffer);
+                        match mid_handshake.handshake() {
+                            Ok(ssl_stream) => {
+                                connected_client.ssl_stream =
+                                    ClientSslStream::HandshakeFinished(ssl_stream);
+                                info!("DTLS handshake finished for remote {:?}", remote_addr);
+                            }
+                            Err(handshake_error) => match handshake_error {
+                                HandshakeError::SetupFailure(err) => {
+                                    warn!(
+                                        "SSL error during handshake with remote {:?}: {}",
+                                        remote_addr, err
+                                    );
+                                }
+                                HandshakeError::Failure(mut mid_handshake) => {
+                                    warn!(
+                                        "SSL handshake failure with remote {:?}: {}",
+                                        remote_addr,
+                                        mid_handshake.error()
+                                    );
+                                    self.outgoing_udp.extend(
+                                        mid_handshake
+                                            .get_mut()
+                                            .outgoing_udp
+                                            .drain(..)
+                                            .map(|p| (p, remote_addr)),
+                                    );
+                                    connected_client.ssl_stream =
+                                        ClientSslStream::MidHandshake(mid_handshake);
+                                }
+                                HandshakeError::WouldBlock(mut mid_handshake) => {
+                                    self.outgoing_udp.extend(
+                                        mid_handshake
+                                            .get_mut()
+                                            .outgoing_udp
+                                            .drain(..)
+                                            .map(|p| (p, remote_addr)),
+                                    );
+                                    connected_client.ssl_stream =
+                                        ClientSslStream::MidHandshake(mid_handshake);
+                                }
+                            },
+                        }
+                    }
+                    ClientSslStream::HandshakeFinished(mut ssl_stream) => {
+                        ssl_stream.get_mut().incoming_udp.push_back(packet_buffer);
+                    }
+                    ClientSslStream::Disconnected => {}
+                }
+
+                if let ClientSslStream::HandshakeFinished(ssl_stream) =
+                    &mut connected_client.ssl_stream
+                {
+                    loop {
+                        let mut ssl_buffer = self.buffer_pool.checkout();
+                        ssl_buffer.resize(MAX_DGRAM_SIZE, 0);
+                        match ssl_stream.ssl_read(&mut ssl_buffer) {
+                            Ok(size) => {
+                                ssl_buffer.truncate(size);
+                                warn!("unimplemented handling of DLTS payload");
+                            }
+                            Err(err) => {
+                                if err.code() == ErrorCode::WANT_READ {
+                                    break;
+                                } else {
+                                    return Err(err
+                                        .into_io_error()
+                                        .map_err(|e| IoError::new(IoErrorKind::Other, e))?);
+                                }
+                            }
+                        }
+                    }
+
+                    self.outgoing_udp.extend(
+                        ssl_stream
+                            .get_mut()
+                            .outgoing_udp
+                            .drain(..)
+                            .map(|p| (p, remote_addr)),
+                    );
+                }
             }
             HashMapEntry::Vacant(vacant) => {
                 if let Some(stun_binding_request) =
@@ -236,15 +336,38 @@ impl RtcServer {
                             pending_client.server_passwd.as_bytes(),
                             &mut packet_buffer,
                         )
-                        .expect("OpenSSL error");
+                        .expect("RtcServer: could not write STUN response packet");
+
                         packet_buffer.truncate(resp_len);
                         self.outgoing_udp.push_back((packet_buffer, remote_addr));
+
+                        let ssl_stream = match self.ssl_acceptor.accept(ClientSslPackets {
+                            buffer_pool: self.buffer_pool.clone(),
+                            incoming_udp: VecDeque::new(),
+                            outgoing_udp: VecDeque::new(),
+                        }) {
+                            Ok(_) => {
+                                unreachable!("handshake cannot finish with no incoming packets")
+                            }
+                            Err(HandshakeError::WouldBlock(mut mid_handshake)) => {
+                                self.outgoing_udp.extend(
+                                    mid_handshake
+                                        .get_mut()
+                                        .outgoing_udp
+                                        .drain(..)
+                                        .map(|p| (p, remote_addr)),
+                                );
+                                ClientSslStream::MidHandshake(mid_handshake)
+                            }
+                            Err(err) => {
+                                panic!("RtcServer: could not accept new SSL stream: {:?}", err)
+                            }
+                        };
+
                         vacant.insert(ConnectedClient {
-                            state: ClientState::DtlsHandshake,
                             last_activity: Instant::now(),
+                            ssl_stream,
                         });
-                    } else {
-                        self.buffer_pool.restore(packet_buffer);
                     }
                 }
             }
@@ -257,8 +380,8 @@ impl RtcServer {
 const MAX_DGRAM_SIZE: usize = 0x10000;
 const SESSION_BUFFER_SIZE: usize = 8;
 
-type OutgoingUdp = VecDeque<(BytesMut, SocketAddr)>;
-type IncomingRtc = VecDeque<(BytesMut, SocketAddr, RtcMessageType)>;
+type OutgoingUdp = VecDeque<(Checkout<Vec<u8>>, SocketAddr)>;
+type IncomingRtc = VecDeque<(Checkout<Vec<u8>>, SocketAddr, RtcMessageType)>;
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct PendingClientKey {
@@ -271,32 +394,54 @@ struct PendingClient {
     last_activity: Instant,
 }
 
-enum ClientState {
-    DtlsHandshake,
-}
-
 struct ConnectedClient {
-    state: ClientState,
     last_activity: Instant,
+    ssl_stream: ClientSslStream,
 }
 
 type PendingClients = HashMap<PendingClientKey, PendingClient>;
 type ConnectedClients = HashMap<SocketAddr, ConnectedClient>;
 
-struct BufferPool(Vec<BytesMut>);
+enum ClientSslStream {
+    MidHandshake(MidHandshakeSslStream<ClientSslPackets>),
+    HandshakeFinished(SslStream<ClientSslPackets>),
+    Disconnected,
+}
 
-impl BufferPool {
-    fn new() -> BufferPool {
-        BufferPool(Vec::new())
+#[derive(Debug)]
+struct ClientSslPackets {
+    buffer_pool: Pool<Vec<u8>>,
+    incoming_udp: VecDeque<Checkout<Vec<u8>>>,
+    outgoing_udp: VecDeque<Checkout<Vec<u8>>>,
+}
+
+impl Read for ClientSslPackets {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        if let Some(next_dgram) = self.incoming_udp.pop_front() {
+            if next_dgram.len() > buf.len() {
+                return Err(IoError::new(
+                    IoErrorKind::Other,
+                    "failed to read entire datagram in SSL stream",
+                ));
+            }
+            buf[0..next_dgram.len()].copy_from_slice(&next_dgram);
+            Ok(next_dgram.len())
+        } else {
+            Err(IoErrorKind::WouldBlock.into())
+        }
+    }
+}
+
+impl Write for ClientSslPackets {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        let mut buffer = self.buffer_pool.checkout();
+        buffer.clear();
+        buffer.extend_from_slice(buf);
+        self.outgoing_udp.push_back(buffer);
+        Ok(buf.len())
     }
 
-    fn acquire(&mut self) -> BytesMut {
-        let mut buffer = self.0.pop().unwrap_or(BytesMut::new());
-        buffer.resize(MAX_DGRAM_SIZE, 0);
-        buffer
-    }
-
-    fn restore(&mut self, buffer: BytesMut) {
-        self.0.push(buffer);
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
     }
 }
