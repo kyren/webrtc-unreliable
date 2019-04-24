@@ -13,9 +13,9 @@ use log::{info, warn};
 use openssl::ssl::{ErrorCode, HandshakeError, MidHandshakeSslStream, SslAcceptor, SslStream};
 use tokio::{net::UdpSocket, timer::Interval};
 
+use crate::buffer_pool::{BufferPool, PooledBuffer};
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
-use crate::pool::{Checkout, Pool};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
 
 #[derive(Debug)]
@@ -55,7 +55,7 @@ pub struct RtcServer {
     ssl_acceptor: SslAcceptor,
     outgoing_udp: OutgoingUdp,
     incoming_rtc: IncomingRtc,
-    buffer_pool: Pool<Vec<u8>>,
+    buffer_pool: BufferPool,
     pending_clients: PendingClients,
     connected_clients: ConnectedClients,
     session_timeout: Duration,
@@ -86,7 +86,7 @@ impl RtcServer {
             ssl_acceptor: crypto.ssl_acceptor,
             outgoing_udp: OutgoingUdp::new(),
             incoming_rtc: IncomingRtc::new(),
-            buffer_pool: Pool::new_unbounded(),
+            buffer_pool: BufferPool::new(),
             pending_clients: PendingClients::new(),
             connected_clients: ConnectedClients::new(),
             session_timeout,
@@ -217,7 +217,7 @@ impl RtcServer {
     }
 
     fn receive_udp(&mut self) -> Poll<(), IoError> {
-        let mut packet_buffer = self.buffer_pool.checkout();
+        let mut packet_buffer = self.buffer_pool.acquire();
         packet_buffer.resize(MAX_DGRAM_SIZE, 0);
         let (len, remote_addr) = try_ready!(self.udp_socket.poll_recv_from(&mut packet_buffer));
         if len > MAX_DGRAM_SIZE {
@@ -294,7 +294,7 @@ impl RtcServer {
                     &mut connected_client.ssl_stream
                 {
                     loop {
-                        let mut ssl_buffer = self.buffer_pool.checkout();
+                        let mut ssl_buffer = self.buffer_pool.acquire();
                         ssl_buffer.resize(MAX_DGRAM_SIZE, 0);
                         match ssl_stream.ssl_read(&mut ssl_buffer) {
                             Ok(size) => {
@@ -380,8 +380,8 @@ impl RtcServer {
 const MAX_DGRAM_SIZE: usize = 0x10000;
 const SESSION_BUFFER_SIZE: usize = 8;
 
-type OutgoingUdp = VecDeque<(Checkout<Vec<u8>>, SocketAddr)>;
-type IncomingRtc = VecDeque<(Checkout<Vec<u8>>, SocketAddr, RtcMessageType)>;
+type OutgoingUdp = VecDeque<(PooledBuffer, SocketAddr)>;
+type IncomingRtc = VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>;
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct PendingClientKey {
@@ -410,9 +410,9 @@ enum ClientSslStream {
 
 #[derive(Debug)]
 struct ClientSslPackets {
-    buffer_pool: Pool<Vec<u8>>,
-    incoming_udp: VecDeque<Checkout<Vec<u8>>>,
-    outgoing_udp: VecDeque<Checkout<Vec<u8>>>,
+    buffer_pool: BufferPool,
+    incoming_udp: VecDeque<PooledBuffer>,
+    outgoing_udp: VecDeque<PooledBuffer>,
 }
 
 impl Read for ClientSslPackets {
@@ -434,8 +434,7 @@ impl Read for ClientSslPackets {
 
 impl Write for ClientSslPackets {
     fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
-        let mut buffer = self.buffer_pool.checkout();
-        buffer.clear();
+        let mut buffer = self.buffer_pool.acquire();
         buffer.extend_from_slice(buf);
         self.outgoing_udp.push_back(buffer);
         Ok(buf.len())
