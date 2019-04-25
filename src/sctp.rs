@@ -479,7 +479,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
 
     let remainder = rest.len();
     let len = dest.len() - remainder;
-    let mut crc = crc32c(&dest[0..len]);
+    let crc = crc32c(&dest[0..len]);
     LittleEndian::write_u32(&mut dest[8..12], crc);
 
     Ok(len)
