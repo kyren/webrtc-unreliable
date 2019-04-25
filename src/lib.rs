@@ -1,6 +1,7 @@
 mod buffer_pool;
 mod crypto;
 mod http;
+mod sctp;
 mod sdp;
 mod server;
 mod stun;

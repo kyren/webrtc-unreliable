@@ -3,7 +3,6 @@ use std::{
     error::Error,
     fmt,
     io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write},
-    mem,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -16,6 +15,7 @@ use tokio::{net::UdpSocket, timer::Interval};
 use crate::buffer_pool::{BufferPool, PooledBuffer};
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
+use crate::sctp::{read_sctp_packet, SctpChunk};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
 
 #[derive(Debug)]
@@ -185,7 +185,7 @@ impl RtcServer {
             self.connected_clients.retain(|_, connected_client| {
                 connected_client.last_activity.elapsed() < session_timeout
                     || match connected_client.ssl_stream {
-                        ClientSslStream::Disconnected => true,
+                        ClientSslStream::Unestablished(None) => true,
                         _ => false,
                     }
             });
@@ -232,74 +232,78 @@ impl RtcServer {
             HashMapEntry::Occupied(mut occupied) => {
                 let connected_client = occupied.get_mut();
                 connected_client.last_activity = Instant::now();
-                match mem::replace(
-                    &mut connected_client.ssl_stream,
-                    ClientSslStream::Disconnected,
-                ) {
-                    ClientSslStream::MidHandshake(mut mid_handshake) => {
-                        mid_handshake
-                            .get_mut()
-                            .incoming_udp
-                            .push_back(packet_buffer);
-                        match mid_handshake.handshake() {
-                            Ok(ssl_stream) => {
-                                connected_client.ssl_stream =
-                                    ClientSslStream::HandshakeFinished(ssl_stream);
-                                info!("DTLS handshake finished for remote {:?}", remote_addr);
+                match &mut connected_client.ssl_stream {
+                    ClientSslStream::Unestablished(maybe_mid_handshake) => {
+                        if let Some(mut mid_handshake) = maybe_mid_handshake.take() {
+                            mid_handshake
+                                .get_mut()
+                                .incoming_udp
+                                .push_back(packet_buffer);
+                            match mid_handshake.handshake() {
+                                Ok(ssl_stream) => {
+                                    connected_client.ssl_stream =
+                                        ClientSslStream::Established(ssl_stream);
+                                    info!("DTLS handshake finished for remote {:?}", remote_addr);
+                                }
+                                Err(handshake_error) => match handshake_error {
+                                    HandshakeError::SetupFailure(err) => {
+                                        warn!(
+                                            "SSL error during handshake with remote {:?}: {}",
+                                            remote_addr, err
+                                        );
+                                    }
+                                    HandshakeError::Failure(mut mid_handshake) => {
+                                        warn!(
+                                            "SSL handshake failure with remote {:?}: {}",
+                                            remote_addr,
+                                            mid_handshake.error()
+                                        );
+                                        self.outgoing_udp.extend(
+                                            mid_handshake
+                                                .get_mut()
+                                                .outgoing_udp
+                                                .drain(..)
+                                                .map(|p| (p, remote_addr)),
+                                        );
+                                        connected_client.ssl_stream =
+                                            ClientSslStream::Unestablished(Some(mid_handshake));
+                                    }
+                                    HandshakeError::WouldBlock(mut mid_handshake) => {
+                                        self.outgoing_udp.extend(
+                                            mid_handshake
+                                                .get_mut()
+                                                .outgoing_udp
+                                                .drain(..)
+                                                .map(|p| (p, remote_addr)),
+                                        );
+                                        connected_client.ssl_stream =
+                                            ClientSslStream::Unestablished(Some(mid_handshake));
+                                    }
+                                },
                             }
-                            Err(handshake_error) => match handshake_error {
-                                HandshakeError::SetupFailure(err) => {
-                                    warn!(
-                                        "SSL error during handshake with remote {:?}: {}",
-                                        remote_addr, err
-                                    );
-                                }
-                                HandshakeError::Failure(mut mid_handshake) => {
-                                    warn!(
-                                        "SSL handshake failure with remote {:?}: {}",
-                                        remote_addr,
-                                        mid_handshake.error()
-                                    );
-                                    self.outgoing_udp.extend(
-                                        mid_handshake
-                                            .get_mut()
-                                            .outgoing_udp
-                                            .drain(..)
-                                            .map(|p| (p, remote_addr)),
-                                    );
-                                    connected_client.ssl_stream =
-                                        ClientSslStream::MidHandshake(mid_handshake);
-                                }
-                                HandshakeError::WouldBlock(mut mid_handshake) => {
-                                    self.outgoing_udp.extend(
-                                        mid_handshake
-                                            .get_mut()
-                                            .outgoing_udp
-                                            .drain(..)
-                                            .map(|p| (p, remote_addr)),
-                                    );
-                                    connected_client.ssl_stream =
-                                        ClientSslStream::MidHandshake(mid_handshake);
-                                }
-                            },
                         }
                     }
-                    ClientSslStream::HandshakeFinished(mut ssl_stream) => {
+                    ClientSslStream::Established(ssl_stream) => {
                         ssl_stream.get_mut().incoming_udp.push_back(packet_buffer);
                     }
-                    ClientSslStream::Disconnected => {}
                 }
 
-                if let ClientSslStream::HandshakeFinished(ssl_stream) =
-                    &mut connected_client.ssl_stream
-                {
+                if let ClientSslStream::Established(ssl_stream) = &mut connected_client.ssl_stream {
                     loop {
                         let mut ssl_buffer = self.buffer_pool.acquire();
                         ssl_buffer.resize(MAX_DGRAM_SIZE, 0);
                         match ssl_stream.ssl_read(&mut ssl_buffer) {
                             Ok(size) => {
                                 ssl_buffer.truncate(size);
-                                warn!("unimplemented handling of DLTS payload");
+                                let mut sctp_chunks = [SctpChunk::Abort; 16];
+                                if let Ok(sctp_packet) =
+                                    read_sctp_packet(&ssl_buffer, &mut sctp_chunks)
+                                {
+                                    warn!("unimplemented handling of SCTP {:?}", sctp_packet);
+                                } else {
+                                    warn!("non-sctp packet received over DTLS");
+                                    hexdump::hexdump(&ssl_buffer);
+                                }
                             }
                             Err(err) => {
                                 if err.code() == ErrorCode::WANT_READ {
@@ -357,7 +361,7 @@ impl RtcServer {
                                         .drain(..)
                                         .map(|p| (p, remote_addr)),
                                 );
-                                ClientSslStream::MidHandshake(mid_handshake)
+                                ClientSslStream::Unestablished(Some(mid_handshake))
                             }
                             Err(err) => {
                                 panic!("RtcServer: could not accept new SSL stream: {:?}", err)
@@ -403,9 +407,8 @@ type PendingClients = HashMap<PendingClientKey, PendingClient>;
 type ConnectedClients = HashMap<SocketAddr, ConnectedClient>;
 
 enum ClientSslStream {
-    MidHandshake(MidHandshakeSslStream<ClientSslPackets>),
-    HandshakeFinished(SslStream<ClientSslPackets>),
-    Disconnected,
+    Unestablished(Option<MidHandshakeSslStream<ClientSslPackets>>),
+    Established(SslStream<ClientSslPackets>),
 }
 
 #[derive(Debug)]
