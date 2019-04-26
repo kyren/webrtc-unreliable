@@ -9,15 +9,18 @@ use std::{
 
 use futures::{try_ready, Async, Poll, Stream};
 use log::warn;
-use openssl::ssl::{MidHandshakeSslStream, SslAcceptor, SslStream};
+use openssl::ssl::SslAcceptor;
 use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::client::Client;
+use crate::client::{Client, CLIENT_UPDATE_INTERVAL, MAX_UDP_PAYLOAD_SIZE};
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
-use crate::MAX_UDP_DGRAM_SIZE;
+
+/// After no indication of a working connection for this amount of time, a client will be considered
+/// timed out and disconnected.
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum RtcSendError {
@@ -59,9 +62,8 @@ pub struct RtcServer {
     buffer_pool: BufferPool,
     pending_clients: PendingClients,
     connected_clients: ConnectedClients,
-    session_timeout: Duration,
-    last_timeout_check: Instant,
-    timeout_check_timer: Interval,
+    last_client_update: Instant,
+    update_timer: Interval,
 }
 
 impl RtcServer {
@@ -69,8 +71,9 @@ impl RtcServer {
         http_listen_addr: SocketAddr,
         udp_listen_addr: SocketAddr,
         public_udp_addr: SocketAddr,
-        session_timeout: Duration,
     ) -> Result<RtcServer, IoError> {
+        const SESSION_BUFFER_SIZE: usize = 8;
+
         let crypto = Crypto::init().expect("RtcServer: Could not initialize OpenSSL primitives");
         let (http_server, incoming_session_stream) = create_http_server(
             &http_listen_addr,
@@ -90,9 +93,8 @@ impl RtcServer {
             buffer_pool: BufferPool::new(),
             pending_clients: PendingClients::new(),
             connected_clients: ConnectedClients::new(),
-            session_timeout,
-            last_timeout_check: Instant::now(),
-            timeout_check_timer: Interval::new_interval(session_timeout),
+            last_client_update: Instant::now(),
+            update_timer: Interval::new_interval(CLIENT_UPDATE_INTERVAL),
         })
     }
 
@@ -166,7 +168,7 @@ impl RtcServer {
                     },
                     PendingClient {
                         server_passwd: incoming_session.server_passwd,
-                        last_activity: Instant::now(),
+                        created: Instant::now(),
                     },
                 );
             } else {
@@ -177,16 +179,24 @@ impl RtcServer {
             }
         }
 
-        self.timeout_check_timer.poll().unwrap();
-        if self.last_timeout_check.elapsed() >= self.session_timeout {
-            let session_timeout = self.session_timeout;
-            self.pending_clients.retain(|_, pending_client| {
-                pending_client.last_activity.elapsed() < session_timeout
+        self.update_timer.poll().unwrap();
+
+        if self.last_client_update.elapsed() >= CLIENT_UPDATE_INTERVAL {
+            self.last_client_update = Instant::now();
+            self.pending_clients
+                .retain(|_, pending_client| pending_client.created.elapsed() < SESSION_TIMEOUT);
+
+            let outgoing_udp = &mut self.outgoing_udp;
+            self.connected_clients.retain(|&remote_addr, client| {
+                if !client.is_shutdown() && client.last_activity().elapsed() < SESSION_TIMEOUT {
+                    outgoing_udp.extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
+                    true
+                } else {
+                    false
+                }
             });
-            self.connected_clients.retain(|_, connected_client| {
-                connected_client.last_activity.elapsed() < session_timeout
-                    && !connected_client.client.is_shutdown()
-            });
+
+            self.send_udp()?;
         }
 
         Ok(())
@@ -216,9 +226,9 @@ impl RtcServer {
 
     fn receive_udp(&mut self) -> Poll<(), IoError> {
         let mut packet_buffer = self.buffer_pool.acquire();
-        packet_buffer.resize(MAX_UDP_DGRAM_SIZE, 0);
+        packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
         let (len, remote_addr) = try_ready!(self.udp_socket.poll_recv_from(&mut packet_buffer));
-        if len > MAX_UDP_DGRAM_SIZE {
+        if len > MAX_UDP_PAYLOAD_SIZE {
             return Err(IoError::new(
                 IoErrorKind::Other,
                 "failed to read entire datagram from socket",
@@ -228,24 +238,12 @@ impl RtcServer {
 
         match self.connected_clients.entry(remote_addr) {
             HashMapEntry::Occupied(mut occupied) => {
-                let connected_client = occupied.get_mut();
-                match connected_client
-                    .client
-                    .receive_incoming_packet(packet_buffer)
-                {
-                    Ok(()) => {
-                        connected_client.last_activity = Instant::now();
-                    }
-                    Err(err) => {
-                        warn!("remote host {:?} error: {}", remote_addr, err);
-                    }
+                let client = occupied.get_mut();
+                if let Err(err) = client.receive_incoming_packet(packet_buffer) {
+                    warn!("remote host {:?} error: {}", remote_addr, err);
                 }
-                self.outgoing_udp.extend(
-                    connected_client
-                        .client
-                        .take_outgoing_packets()
-                        .map(|p| (p, remote_addr)),
-                );
+                self.outgoing_udp
+                    .extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
             }
             HashMapEntry::Vacant(vacant) => {
                 if let Some(stun_binding_request) =
@@ -266,14 +264,10 @@ impl RtcServer {
                         packet_buffer.truncate(resp_len);
                         self.outgoing_udp.push_back((packet_buffer, remote_addr));
 
-                        let client =
-                            Client::new(self.buffer_pool.clone(), remote_addr, &self.ssl_acceptor)
-                                .expect("could not start DTLS handshake");
-
-                        vacant.insert(ConnectedClient {
-                            last_activity: Instant::now(),
-                            client,
-                        });
+                        vacant.insert(
+                            Client::new(&self.ssl_acceptor, self.buffer_pool.clone(), remote_addr)
+                                .expect("could not start DTLS handshake"),
+                        );
                     }
                 }
             }
@@ -282,8 +276,6 @@ impl RtcServer {
         Ok(Async::Ready(()))
     }
 }
-
-const SESSION_BUFFER_SIZE: usize = 8;
 
 type OutgoingUdp = VecDeque<(PooledBuffer, SocketAddr)>;
 type IncomingRtc = VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>;
@@ -296,13 +288,8 @@ struct PendingClientKey {
 
 struct PendingClient {
     server_passwd: String,
-    last_activity: Instant,
-}
-
-struct ConnectedClient {
-    client: Client,
-    last_activity: Instant,
+    created: Instant,
 }
 
 type PendingClients = HashMap<PendingClientKey, PendingClient>;
-type ConnectedClients = HashMap<SocketAddr, ConnectedClient>;
+type ConnectedClients = HashMap<SocketAddr, Client>;

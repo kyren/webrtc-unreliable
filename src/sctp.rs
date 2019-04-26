@@ -51,6 +51,7 @@ pub enum SctpChunk<'a> {
     Shutdown {
         cumulative_tsn_ack: u32,
     },
+    ShutdownAck,
     CookieEcho {
         state_cookie: &'a [u8],
     },
@@ -62,10 +63,10 @@ pub enum SctpChunk<'a> {
 
 #[derive(Debug)]
 pub struct SctpPacket<'a> {
-    source_port: u16,
-    dest_port: u16,
-    verification_tag: u32,
-    chunks: &'a [SctpChunk<'a>],
+    pub source_port: u16,
+    pub dest_port: u16,
+    pub verification_tag: u32,
+    pub chunks: &'a [SctpChunk<'a>],
 }
 
 #[derive(Debug)]
@@ -89,6 +90,7 @@ impl Error for SctpReadError {}
 
 pub fn read_sctp_packet<'a>(
     src: &'a [u8],
+    check_crc: bool,
     chunk_space: &'a mut [SctpChunk<'a>],
 ) -> Result<SctpPacket<'a>, SctpReadError> {
     if src.len() < 16 {
@@ -100,12 +102,14 @@ pub fn read_sctp_packet<'a>(
     let verification_tag = NetworkEndian::read_u32(&src[4..8]);
     let checksum = LittleEndian::read_u32(&src[8..12]);
 
-    let mut crc = 0;
-    crc = crc32c_append(crc, &src[0..8]);
-    crc = crc32c_append(crc, &[0, 0, 0, 0]);
-    crc = crc32c_append(crc, &src[12..]);
-    if crc != checksum {
-        return Err(SctpReadError::BadChecksum);
+    if check_crc {
+        let mut crc = 0;
+        crc = crc32c_append(crc, &src[0..8]);
+        crc = crc32c_append(crc, &[0, 0, 0, 0]);
+        crc = crc32c_append(crc, &src[12..]);
+        if crc != checksum {
+            return Err(SctpReadError::BadChecksum);
+        }
     }
 
     let mut remaining_chunks = &src[12..];
@@ -120,7 +124,13 @@ pub fn read_sctp_packet<'a>(
         let chunk_flags = remaining_chunks[1];
         let chunk_len = NetworkEndian::read_u16(&remaining_chunks[2..4]);
 
-        if chunk_len as usize > remaining_chunks.len() {
+        let chunk_next = if chunk_len % 4 == 0 {
+            chunk_len
+        } else {
+            chunk_len - chunk_len % 4 + 4
+        };
+
+        if chunk_next as usize > remaining_chunks.len() || chunk_len < 4 {
             return Err(SctpReadError::BadPacket);
         }
 
@@ -234,6 +244,9 @@ pub fn read_sctp_packet<'a>(
 
                 *chunk = SctpChunk::Shutdown { cumulative_tsn_ack };
             }
+            CHUNK_TYPE_SHUTDOWN_ACK => {
+                *chunk = SctpChunk::ShutdownAck;
+            }
             CHUNK_TYPE_COOKIE_ECHO => {
                 *chunk = SctpChunk::CookieEcho {
                     state_cookie: chunk_data,
@@ -253,7 +266,7 @@ pub fn read_sctp_packet<'a>(
             _ => unimplemented!(),
         }
 
-        remaining_chunks = &remaining_chunks[chunk_len as usize..];
+        remaining_chunks = &remaining_chunks[chunk_next as usize..];
         chunk_count += 1;
     }
 
@@ -305,7 +318,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
             return Err(SctpWriteError::BufferSize);
         }
 
-        let (chunk_header, chunk_data) = rest.split_at_mut(8);
+        let (chunk_header, chunk_data) = rest.split_at_mut(4);
         let (chunk_type, chunk_flags, data_len) = match chunk {
             SctpChunk::Data {
                 chunk_flags,
@@ -369,13 +382,12 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 NetworkEndian::write_u16(&mut chunk_data[16..18], INIT_ACK_PARAM_STATE_COOKIE);
                 NetworkEndian::write_u16(
                     &mut chunk_data[18..20],
-                    state_cookie
-                        .len()
+                    (state_cookie.len() + 4)
                         .try_into()
                         .map_err(|_| SctpWriteError::OutOfRange)?,
                 );
 
-                chunk_data[20..].copy_from_slice(state_cookie);
+                chunk_data[20..data_len].copy_from_slice(state_cookie);
 
                 (CHUNK_TYPE_INIT_ACK, 0, data_len)
             }
@@ -414,8 +426,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                     NetworkEndian::write_u16(&mut chunk_data[0..2], HEARTBEAT_PARAM_INFO);
                     NetworkEndian::write_u16(
                         &mut chunk_data[2..4],
-                        heartbeat_info
-                            .len()
+                        (heartbeat_info.len() + 4)
                             .try_into()
                             .map_err(|_| SctpWriteError::OutOfRange)?,
                     );
@@ -436,6 +447,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 NetworkEndian::write_u32(&mut chunk_data[0..4], cumulative_tsn_ack);
                 (CHUNK_TYPE_SHUTDOWN, 0, data_len)
             }
+            SctpChunk::ShutdownAck => (CHUNK_TYPE_SHUTDOWN_ACK, 0, 0),
             SctpChunk::CookieEcho { state_cookie } => {
                 if chunk_data.len() < state_cookie.len() {
                     return Err(SctpWriteError::BufferSize);
@@ -493,6 +505,7 @@ const CHUNK_TYPE_HEARTBEAT: u8 = 0x04;
 const CHUNK_TYPE_HEARTBEAT_ACK: u8 = 0x05;
 const CHUNK_TYPE_ABORT: u8 = 0x06;
 const CHUNK_TYPE_SHUTDOWN: u8 = 0x07;
+const CHUNK_TYPE_SHUTDOWN_ACK: u8 = 0x08;
 const CHUNK_TYPE_COOKIE_ECHO: u8 = 0x0a;
 const CHUNK_TYPE_COOKIE_ACK: u8 = 0x0b;
 const CHUNK_TYPE_FORWARD_TSN: u8 = 0xc0;
