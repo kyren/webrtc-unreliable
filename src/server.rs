@@ -119,8 +119,6 @@ impl RtcServer {
         self.outgoing_udp
             .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
 
-        try_ready!(self.send_udp().map_err(RtcSendError::IoError));
-
         Ok(Async::Ready(()))
     }
 
