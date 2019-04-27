@@ -84,11 +84,6 @@ fn main() {
                 match rtc_server.receive(&mut message_buf) {
                     Ok(Async::Ready(incoming_message)) => {
                         last_message = Some(incoming_message);
-                        println!(
-                            "{:?} {:?}",
-                            incoming_message,
-                            &message_buf[0..incoming_message.message_len]
-                        );
                         work_done = true;
                     }
                     Ok(Async::NotReady) => {}

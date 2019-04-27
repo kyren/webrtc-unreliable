@@ -20,10 +20,6 @@ use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
 
-/// After no indication of a working connection for this amount of time, a client will be considered
-/// timed out and disconnected.
-pub const SESSION_TIMEOUT: Duration = Duration::from_secs(8);
-
 #[derive(Debug)]
 pub enum RtcError {
     /// Non-fatal error trying to send a message to a disconnected client.
@@ -96,11 +92,11 @@ pub struct RtcServer {
     http_server: HttpServer,
     incoming_session_stream: IncomingSessionStream,
     ssl_acceptor: SslAcceptor,
-    outgoing_udp: OutgoingUdp,
-    incoming_rtc: IncomingRtc,
+    outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
+    incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>,
     buffer_pool: BufferPool,
-    pending_clients: PendingClients,
-    connected_clients: ConnectedClients,
+    ice_clients: HashMap<IceClientKey, IceClient>,
+    rtc_clients: HashMap<SocketAddr, RtcClient>,
     last_client_update: Instant,
     update_timer: Interval,
 }
@@ -127,11 +123,11 @@ impl RtcServer {
             http_server,
             incoming_session_stream,
             ssl_acceptor: crypto.ssl_acceptor,
-            outgoing_udp: OutgoingUdp::new(),
-            incoming_rtc: IncomingRtc::new(),
+            outgoing_udp: VecDeque::new(),
+            incoming_rtc: VecDeque::new(),
             buffer_pool: BufferPool::new(),
-            pending_clients: PendingClients::new(),
-            connected_clients: ConnectedClients::new(),
+            ice_clients: HashMap::new(),
+            rtc_clients: HashMap::new(),
             last_client_update: Instant::now(),
             update_timer: Interval::new_interval(CLIENT_UPDATE_INTERVAL),
         })
@@ -141,7 +137,7 @@ impl RtcServer {
     /// can send messages back and forth.  Returns false for disconnected clients as well as those
     /// that are still starting up or are in the process of shutting down.
     pub fn is_connected(&self, remote_addr: &SocketAddr) -> bool {
-        if let Some(client) = self.connected_clients.get(remote_addr) {
+        if let Some(client) = self.rtc_clients.get(remote_addr) {
             client.is_established()
         } else {
             false
@@ -150,7 +146,7 @@ impl RtcServer {
 
     /// Disconect the given client, does nothing if the client is not currently connected.
     pub fn disconnect(&mut self, remote_addr: &SocketAddr) {
-        if let Some(client) = self.connected_clients.get_mut(remote_addr) {
+        if let Some(client) = self.rtc_clients.get_mut(remote_addr) {
             if let Err(err) = client.start_shutdown() {
                 warn!(
                     "error starting shutdown for client {:?}: {}",
@@ -171,7 +167,7 @@ impl RtcServer {
         try_ready!(self.send_udp());
 
         let client = self
-            .connected_clients
+            .rtc_clients
             .get_mut(remote_addr)
             .ok_or(RtcError::ClientNotConnected)?;
 
@@ -244,14 +240,14 @@ impl RtcServer {
                     incoming_session.server_user, incoming_session.remote_user
                 );
 
-                self.pending_clients.insert(
-                    PendingClientKey {
+                self.ice_clients.insert(
+                    IceClientKey {
                         server_user: incoming_session.server_user,
                         remote_user: incoming_session.remote_user,
                     },
-                    PendingClient {
+                    IceClient {
                         server_passwd: incoming_session.server_passwd,
-                        created: Instant::now(),
+                        ttl: Instant::now(),
                     },
                 );
             } else {
@@ -279,20 +275,19 @@ impl RtcServer {
 
         if self.last_client_update.elapsed() >= CLIENT_UPDATE_INTERVAL {
             self.last_client_update = Instant::now();
-            self.pending_clients
-                .retain(|pending_client_key, pending_client| {
-                    if pending_client.created.elapsed() < SESSION_TIMEOUT {
-                        true
-                    } else {
-                        warn!(
-                            "ICE session timeout for server user '{}' and remote user '{}'",
-                            pending_client_key.server_user, pending_client_key.remote_user
-                        );
-                        false
-                    }
-                });
+            self.ice_clients.retain(|ice_client_key, ice_client| {
+                if ice_client.ttl.elapsed() < ICE_SESSION_TIMEOUT {
+                    true
+                } else {
+                    info!(
+                        "ICE session timeout for server user '{}' and remote user '{}'",
+                        ice_client_key.server_user, ice_client_key.remote_user
+                    );
+                    false
+                }
+            });
 
-            for (remote_addr, client) in &mut self.connected_clients {
+            for (remote_addr, client) in &mut self.rtc_clients {
                 if let Err(err) = client.update() {
                     warn!("error for client {:?}, shutting down: {}", remote_addr, err);
                     let _ = client.start_shutdown();
@@ -300,13 +295,13 @@ impl RtcServer {
             }
 
             let outgoing_udp = &mut self.outgoing_udp;
-            self.connected_clients.retain(|&remote_addr, client| {
-                if !client.is_shutdown() && client.last_activity().elapsed() < SESSION_TIMEOUT {
+            self.rtc_clients.retain(|&remote_addr, client| {
+                if !client.is_shutdown() && client.last_activity().elapsed() < RTC_SESSION_TIMEOUT {
                     outgoing_udp.extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
                     true
                 } else {
                     if !client.is_shutdown() {
-                        warn!("timeout for client {:?}", remote_addr);
+                        info!("timeout for client {:?}", remote_addr);
                     }
                     info!("client {:?} removed", remote_addr);
                     false
@@ -360,9 +355,39 @@ impl RtcServer {
         }
         packet_buffer.truncate(len);
 
-        match self.connected_clients.entry(remote_addr) {
-            HashMapEntry::Occupied(mut occupied) => {
-                let client = occupied.get_mut();
+        if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[0..len]) {
+            if let Some(ice_client) = self.ice_clients.get_mut(&IceClientKey {
+                server_user: stun_binding_request.server_user,
+                remote_user: stun_binding_request.remote_user,
+            }) {
+                ice_client.ttl = Instant::now();
+                let resp_len = write_stun_success_response(
+                    stun_binding_request.transaction_id,
+                    remote_addr,
+                    ice_client.server_passwd.as_bytes(),
+                    &mut packet_buffer,
+                )
+                .map_err(RtcInternalError::Other)?;
+
+                packet_buffer.truncate(resp_len);
+                self.outgoing_udp.push_back((packet_buffer, remote_addr));
+
+                match self.rtc_clients.entry(remote_addr) {
+                    HashMapEntry::Vacant(vacant) => {
+                        vacant.insert(
+                            RtcClient::new(
+                                &self.ssl_acceptor,
+                                self.buffer_pool.clone(),
+                                remote_addr,
+                            )
+                            .map_err(|e| RtcInternalError::Other(e.into()))?,
+                        );
+                    }
+                    HashMapEntry::Occupied(_) => {}
+                }
+            }
+        } else {
+            if let Some(client) = self.rtc_clients.get_mut(&remote_addr) {
                 if let Err(err) = client.receive_incoming_packet(packet_buffer) {
                     warn!(
                         "client {:?} had unexpected error receiving UDP packet, shutting down: {}",
@@ -378,55 +403,22 @@ impl RtcServer {
                         .map(|(message_type, message)| (message, remote_addr, message_type)),
                 );
             }
-            HashMapEntry::Vacant(vacant) => {
-                if let Some(stun_binding_request) =
-                    parse_stun_binding_request(&packet_buffer[0..len])
-                {
-                    if let Some(pending_client) = self.pending_clients.remove(&PendingClientKey {
-                        server_user: stun_binding_request.server_user,
-                        remote_user: stun_binding_request.remote_user,
-                    }) {
-                        let resp_len = write_stun_success_response(
-                            stun_binding_request.transaction_id,
-                            remote_addr,
-                            pending_client.server_passwd.as_bytes(),
-                            &mut packet_buffer,
-                        )
-                        .map_err(RtcInternalError::Other)?;
-
-                        packet_buffer.truncate(resp_len);
-                        self.outgoing_udp.push_back((packet_buffer, remote_addr));
-
-                        vacant.insert(
-                            RtcClient::new(
-                                &self.ssl_acceptor,
-                                self.buffer_pool.clone(),
-                                remote_addr,
-                            )
-                            .map_err(|e| RtcInternalError::Other(e.into()))?,
-                        );
-                    }
-                }
-            }
         }
 
         Ok(Async::Ready(()))
     }
 }
 
-type OutgoingUdp = VecDeque<(PooledBuffer, SocketAddr)>;
-type IncomingRtc = VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>;
+const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+const ICE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
-struct PendingClientKey {
+struct IceClientKey {
     server_user: String,
     remote_user: String,
 }
 
-struct PendingClient {
+struct IceClient {
     server_passwd: String,
-    created: Instant,
+    ttl: Instant,
 }
-
-type PendingClients = HashMap<PendingClientKey, PendingClient>;
-type ConnectedClients = HashMap<SocketAddr, RtcClient>;
