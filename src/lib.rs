@@ -9,4 +9,4 @@ mod stun;
 mod util;
 
 pub use client::RtcMessageType;
-pub use server::{RtcMessageResult, RtcSendError, RtcServer};
+pub use server::{RtcError, RtcMessageResult, RtcServer};

@@ -465,7 +465,8 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
         for i in data_len..data_padded_len {
             chunk_data[i] = 0;
         }
-        let chunk_len = data_padded_len + 4;
+        let chunk_len = data_len + 4;
+        let chunk_padded_len = data_padded_len + 4;
 
         chunk_header[0] = chunk_type;
         chunk_header[1] = chunk_flags;
@@ -476,7 +477,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 .map_err(|_| SctpWriteError::OutOfRange)?,
         );
 
-        rest = &mut rest[chunk_len..];
+        rest = &mut rest[chunk_padded_len..];
     }
 
     let remainder = rest.len();

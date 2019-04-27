@@ -3,7 +3,7 @@ use futures::{future, Async, Future};
 use tokio::runtime::Runtime;
 
 use log::warn;
-use rtcdata::{RtcMessageResult, RtcSendError, RtcServer};
+use rtcdata::{RtcError, RtcMessageResult, RtcServer};
 
 fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -75,26 +75,32 @@ fn main() {
                     Ok(Async::NotReady) => {
                         last_message = Some(last);
                     }
-                    Err(RtcSendError::ClientNotConnected) => {}
-                    Err(RtcSendError::IoError(err)) => {
-                        warn!("could not send message to {:?}: {}", last.remote_addr, err)
-                    }
+                    Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
+                    Err(err) => warn!("could not send message to {:?}: {}", last.remote_addr, err),
                 }
             }
 
             if last_message.is_none() {
-                if let Async::Ready(incoming_message) =
-                    rtc_server.receive(&mut message_buf).unwrap()
-                {
-                    last_message = Some(incoming_message);
-                    work_done = true;
+                match rtc_server.receive(&mut message_buf) {
+                    Ok(Async::Ready(incoming_message)) => {
+                        last_message = Some(incoming_message);
+                        println!(
+                            "{:?} {:?}",
+                            incoming_message,
+                            &message_buf[0..incoming_message.message_len]
+                        );
+                        work_done = true;
+                    }
+                    Ok(Async::NotReady) => {}
+                    Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
+                    Err(err) => warn!("could not receive RTC message: {}", err),
                 }
             }
             if !work_done {
                 break;
             }
         }
-        rtc_server.process().unwrap();
+        rtc_server.process().expect("internal WebRTC server error");
 
         Ok(Async::NotReady)
     })));

@@ -1,7 +1,10 @@
 use std::{
     collections::VecDeque,
+    error::Error,
+    fmt,
     io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write},
     iter::Iterator,
+    mem,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -29,6 +32,37 @@ pub const CLIENT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
 pub const MAX_DTLS_MESSAGE_SIZE: usize = 16384;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 65507;
+
+#[derive(Debug)]
+pub enum RtcClientError {
+    TlsError(SslError),
+    OpenSslError(OpenSslErrorStack),
+    NotConnected,
+    NotEstablished,
+    IncompletePacketRead,
+    IncompletePacketWrite,
+}
+
+impl fmt::Display for RtcClientError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            RtcClientError::TlsError(err) => fmt::Display::fmt(err, f),
+            RtcClientError::OpenSslError(err) => fmt::Display::fmt(err, f),
+            RtcClientError::NotConnected => write!(f, "client is not connected"),
+            RtcClientError::NotEstablished => {
+                write!(f, "client does not have an established WebRTC data channel")
+            }
+            RtcClientError::IncompletePacketRead => {
+                write!(f, "WebRTC connection packet not completely read")
+            }
+            RtcClientError::IncompletePacketWrite => {
+                write!(f, "WebRTC connection packet not completely written")
+            }
+        }
+    }
+}
+
+impl Error for RtcClientError {}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum RtcMessageType {
@@ -69,7 +103,7 @@ impl RtcClient {
             outgoing_udp: VecDeque::new(),
         }) {
             Ok(_) => unreachable!("handshake cannot finish with no incoming packets"),
-            Err(HandshakeError::SetupFailure(err)) => Err(err),
+            Err(HandshakeError::SetupFailure(err)) => return Err(err),
             Err(HandshakeError::Failure(_)) => {
                 unreachable!("handshake cannot fail before starting")
             }
@@ -104,12 +138,14 @@ impl RtcClient {
     }
 
     /// Request SCTP and DTLS shutdown, connection immediately becomes un-established
-    pub fn start_shutdown(&mut self) -> Result<(), IoError> {
-        match &mut self.ssl_state {
-            ClientSslState::Established(ssl_stream) => {
+    pub fn start_shutdown(&mut self) -> Result<(), RtcClientError> {
+        match mem::replace(&mut self.ssl_state, ClientSslState::Unestablished(None)) {
+            ClientSslState::Established(mut ssl_stream) => {
                 if self.sctp_state != SctpState::Shutdown {
+                    // We only send one abort packet because the DTLS connection is closed
+                    // immediately after this.
                     send_sctp_packet(
-                        ssl_stream,
+                        &mut ssl_stream,
                         SctpPacket {
                             source_port: self.sctp_local_port,
                             dest_port: self.sctp_remote_port,
@@ -118,8 +154,10 @@ impl RtcClient {
                         },
                     )?;
                     self.last_sent = Instant::now();
+                    self.sctp_state = SctpState::Shutdown;
                 }
-                ssl_stream.shutdown().map_err(ssl_err_to_io_err)?;
+                ssl_stream.shutdown().map_err(ssl_err_to_client_err)?;
+                self.ssl_state = ClientSslState::Shutdown(ssl_stream);
             }
             _ => {}
         }
@@ -135,7 +173,8 @@ impl RtcClient {
     }
 
     /// Must be called at `CLIENT_UPDATE_INTERVAL` or faster, may produce outgoing packets.
-    pub fn update(&mut self) -> Result<(), IoError> {
+    pub fn update(&mut self) -> Result<(), RtcClientError> {
+        // We send heartbeat packets if the last sent packet was more than HEARTBEAT_INTERVAL ago
         if self.last_sent.elapsed() > HEARTBEAT_INTERVAL {
             match &mut self.ssl_state {
                 ClientSslState::Established(ssl_stream) => {
@@ -162,7 +201,10 @@ impl RtcClient {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub fn receive_incoming_packet(&mut self, udp_packet: PooledBuffer) -> Result<(), IoError> {
+    pub fn receive_incoming_packet(
+        &mut self,
+        udp_packet: PooledBuffer,
+    ) -> Result<(), RtcClientError> {
         match &mut self.ssl_state {
             ClientSslState::Unestablished(maybe_mid_handshake) => {
                 if let Some(mut mid_handshake) = maybe_mid_handshake.take() {
@@ -174,7 +216,7 @@ impl RtcClient {
                         }
                         Err(handshake_error) => match handshake_error {
                             HandshakeError::SetupFailure(err) => {
-                                return Err(IoError::new(IoErrorKind::ConnectionRefused, err));
+                                return Err(RtcClientError::OpenSslError(err));
                             }
                             HandshakeError::Failure(mid_handshake) => {
                                 warn!(
@@ -190,38 +232,40 @@ impl RtcClient {
                         },
                     }
                 } else {
-                    return Err(IoErrorKind::NotConnected.into());
+                    return Err(RtcClientError::NotConnected);
                 }
             }
             ClientSslState::Established(ssl_stream) => {
                 ssl_stream.get_mut().incoming_udp.push_back(udp_packet);
             }
+            ClientSslState::Shutdown(ssl_stream) => {
+                ssl_stream.get_mut().incoming_udp.push_back(udp_packet);
+                if ssl_stream.get_shutdown() == ShutdownState::RECEIVED {
+                    self.ssl_state = ClientSslState::Unestablished(None);
+                }
+            }
         }
 
         while let ClientSslState::Established(ssl_stream) = &mut self.ssl_state {
-            if ssl_stream.get_shutdown() == ShutdownState::RECEIVED {
-                self.ssl_state = ClientSslState::Unestablished(None);
-            } else {
-                let mut ssl_buffer = ssl_stream.get_ref().buffer_pool.acquire();
-                ssl_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
-                match ssl_stream.ssl_read(&mut ssl_buffer) {
-                    Ok(size) => {
-                        let mut sctp_chunks = [SctpChunk::Abort; SCTP_MAX_CHUNKS];
-                        match read_sctp_packet(&ssl_buffer[0..size], false, &mut sctp_chunks) {
-                            Ok(sctp_packet) => {
-                                self.receive_sctp_packet(&sctp_packet)?;
-                            }
-                            Err(err) => {
-                                warn!("sctp error on packet received over DTLS: {:?}", err);
-                            }
+            let mut ssl_buffer = ssl_stream.get_ref().buffer_pool.acquire();
+            ssl_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
+            match ssl_stream.ssl_read(&mut ssl_buffer) {
+                Ok(size) => {
+                    let mut sctp_chunks = [SctpChunk::Abort; SCTP_MAX_CHUNKS];
+                    match read_sctp_packet(&ssl_buffer[0..size], false, &mut sctp_chunks) {
+                        Ok(sctp_packet) => {
+                            self.receive_sctp_packet(&sctp_packet)?;
+                        }
+                        Err(err) => {
+                            warn!("sctp read error on packet received over DTLS: {:?}", err);
                         }
                     }
-                    Err(err) => {
-                        if err.code() == ErrorCode::WANT_READ {
-                            break;
-                        } else {
-                            return Err(ssl_err_to_io_err(err));
-                        }
+                }
+                Err(err) => {
+                    if err.code() == ErrorCode::WANT_READ {
+                        break;
+                    } else {
+                        return Err(ssl_err_to_client_err(err));
                     }
                 }
             }
@@ -236,7 +280,7 @@ impl RtcClient {
                 Some(mid_handshake.get_mut().outgoing_udp.drain(..))
             }
             ClientSslState::Unestablished(None) => None,
-            ClientSslState::Established(ssl_stream) => {
+            ClientSslState::Established(ssl_stream) | ClientSslState::Shutdown(ssl_stream) => {
                 Some(ssl_stream.get_mut().outgoing_udp.drain(..))
             }
         })
@@ -248,22 +292,16 @@ impl RtcClient {
         &mut self,
         message_type: RtcMessageType,
         message: &[u8],
-    ) -> Result<(), IoError> {
+    ) -> Result<(), RtcClientError> {
         let ssl_stream = match &mut self.ssl_state {
             ClientSslState::Established(ssl_stream) => ssl_stream,
             _ => {
-                return Err(IoError::new(
-                    IoErrorKind::NotConnected,
-                    "cannot send WebRTC message, DTLS stream disconnected",
-                ))
+                return Err(RtcClientError::NotConnected);
             }
         };
 
         if self.sctp_state != SctpState::Established {
-            return Err(IoError::new(
-                IoErrorKind::NotConnected,
-                "cannot send WebRTC message, SCTP connection not established",
-            ));
+            return Err(RtcClientError::NotEstablished);
         }
 
         let proto_id = if message_type == RtcMessageType::Text {
@@ -299,7 +337,7 @@ impl RtcClient {
         self.received_messages.drain(..)
     }
 
-    fn receive_sctp_packet(&mut self, sctp_packet: &SctpPacket) -> Result<(), IoError> {
+    fn receive_sctp_packet(&mut self, sctp_packet: &SctpPacket) -> Result<(), RtcClientError> {
         let ssl_stream = match &mut self.ssl_state {
             ClientSslState::Established(ssl_stream) => ssl_stream,
             _ => panic!("receive_sctp_packet called in ssl unestablished state"),
@@ -478,7 +516,7 @@ impl RtcClient {
                 }
                 SctpChunk::ShutdownAck { .. } | SctpChunk::Abort => {
                     self.sctp_state = SctpState::Shutdown;
-                    ssl_stream.shutdown().map_err(ssl_err_to_io_err)?;
+                    ssl_stream.shutdown().map_err(ssl_err_to_client_err)?;
                 }
                 SctpChunk::ForwardTsn { new_cumulative_tsn } => {
                     self.sctp_remote_tsn = new_cumulative_tsn;
@@ -494,6 +532,7 @@ impl RtcClient {
 enum ClientSslState {
     Unestablished(Option<MidHandshakeSslStream<ClientSslPackets>>),
     Established(SslStream<ClientSslPackets>),
+    Shutdown(SslStream<ClientSslPackets>),
 }
 
 #[derive(Debug)]
@@ -509,7 +548,7 @@ impl Read for ClientSslPackets {
             if next_packet.len() > buf.len() {
                 return Err(IoError::new(
                     IoErrorKind::Other,
-                    "failed to read entire datagram in SSL stream",
+                    RtcClientError::IncompletePacketRead,
                 ));
             }
             buf[0..next_packet.len()].copy_from_slice(&next_packet);
@@ -552,10 +591,14 @@ enum SctpState {
     Established,
 }
 
-fn ssl_err_to_io_err(err: SslError) -> IoError {
+fn ssl_err_to_client_err(err: SslError) -> RtcClientError {
     match err.into_io_error() {
-        Ok(err) => err,
-        Err(err) => IoError::new(IoErrorKind::Other, err),
+        Ok(err) => *err
+            .into_inner()
+            .expect("io error does not have inner error")
+            .downcast()
+            .expect("inner io error was not RtcClientError"),
+        Err(err) => RtcClientError::TlsError(err),
     }
 }
 
@@ -578,17 +621,14 @@ fn max_tsn(a: u32, b: u32) -> u32 {
 fn send_sctp_packet(
     ssl_stream: &mut SslStream<ClientSslPackets>,
     sctp_packet: SctpPacket,
-) -> Result<(), IoError> {
+) -> Result<(), RtcClientError> {
     let mut sctp_buffer = ssl_stream.get_ref().buffer_pool.acquire();
     sctp_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
 
     let packet_len = match write_sctp_packet(&mut sctp_buffer, sctp_packet) {
         Ok(len) => len,
         Err(SctpWriteError::BufferSize) => {
-            return Err(IoError::new(
-                IoErrorKind::InvalidData,
-                "SCTP packet too large",
-            ))
+            return Err(RtcClientError::IncompletePacketWrite);
         }
         Err(err) => panic!("error writing SCTP packet: {}", err),
     };
@@ -596,7 +636,7 @@ fn send_sctp_packet(
     assert_eq!(
         ssl_stream
             .ssl_write(&sctp_buffer[0..packet_len])
-            .map_err(ssl_err_to_io_err)?,
+            .map_err(ssl_err_to_client_err)?,
         packet_len
     );
 
