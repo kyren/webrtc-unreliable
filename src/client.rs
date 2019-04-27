@@ -10,15 +10,19 @@ use log::{info, warn};
 use openssl::{
     error::ErrorStack as OpenSslErrorStack,
     ssl::{
-        Error as SslError, ErrorCode, HandshakeError, MidHandshakeSslStream, SslAcceptor, SslStream,
+        Error as SslError, ErrorCode, HandshakeError, MidHandshakeSslStream, ShutdownState,
+        SslAcceptor, SslStream,
     },
 };
 use rand::{thread_rng, Rng};
 
 use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::sctp::{read_sctp_packet, write_sctp_packet, SctpChunk, SctpPacket};
+use crate::sctp::{
+    read_sctp_packet, write_sctp_packet, SctpChunk, SctpPacket, SctpWriteError,
+    SCTP_FLAG_COMPLETE_UNRELIABLE,
+};
 
-/// Maximum time between calls to `Client::update` (for heartbeat packets, shutdown resends, etc)
+/// Maximum time between calls to `RtcClient::update`
 pub const CLIENT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 // TODO: I'm not sure whether this is correct
@@ -26,10 +30,20 @@ pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
 pub const MAX_DTLS_MESSAGE_SIZE: usize = 16384;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 65507;
 
-pub struct Client {
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum RtcMessageType {
+    Text,
+    Binary,
+}
+
+pub struct RtcClient {
     remote_addr: SocketAddr,
     ssl_state: ClientSslState,
+
     last_activity: Instant,
+    last_sent: Instant,
+
+    received_messages: Vec<(RtcMessageType, PooledBuffer)>,
 
     sctp_state: SctpState,
 
@@ -41,16 +55,14 @@ pub struct Client {
 
     sctp_local_tsn: u32,
     sctp_remote_tsn: u32,
-
-    sctp_last_heartbeat: Instant,
 }
 
-impl Client {
+impl RtcClient {
     pub fn new(
         ssl_acceptor: &SslAcceptor,
         buffer_pool: BufferPool,
         remote_addr: SocketAddr,
-    ) -> Result<Client, OpenSslErrorStack> {
+    ) -> Result<RtcClient, OpenSslErrorStack> {
         match ssl_acceptor.accept(ClientSslPackets {
             buffer_pool: buffer_pool.clone(),
             incoming_udp: VecDeque::new(),
@@ -61,10 +73,12 @@ impl Client {
             Err(HandshakeError::Failure(_)) => {
                 unreachable!("handshake cannot fail before starting")
             }
-            Err(HandshakeError::WouldBlock(mid_handshake)) => Ok(Client {
+            Err(HandshakeError::WouldBlock(mid_handshake)) => Ok(RtcClient {
                 remote_addr,
                 ssl_state: ClientSslState::Unestablished(Some(mid_handshake)),
                 last_activity: Instant::now(),
+                last_sent: Instant::now(),
+                received_messages: Vec::new(),
                 sctp_state: SctpState::Shutdown,
                 sctp_local_port: 0,
                 sctp_remote_port: 0,
@@ -72,15 +86,14 @@ impl Client {
                 sctp_remote_verification_tag: 0,
                 sctp_local_tsn: 0,
                 sctp_remote_tsn: 0,
-                sctp_last_heartbeat: Instant::now(),
             }),
         }
     }
 
     /// DTLS and SCTP states are established, and RTC messages may be sent
     pub fn is_established(&self) -> bool {
-        match (&self.ssl_state, &self.sctp_state) {
-            (ClientSslState::Established(_), SctpState::Established { .. }) => true,
+        match (&self.ssl_state, self.sctp_state) {
+            (ClientSslState::Established(_), SctpState::Established) => true,
             _ => false,
         }
     }
@@ -91,8 +104,26 @@ impl Client {
     }
 
     /// Request SCTP and DTLS shutdown, connection immediately becomes un-established
-    pub fn start_shutdown(&mut self) {
-        unimplemented!()
+    pub fn start_shutdown(&mut self) -> Result<(), IoError> {
+        match &mut self.ssl_state {
+            ClientSslState::Established(ssl_stream) => {
+                if self.sctp_state != SctpState::Shutdown {
+                    send_sctp_packet(
+                        ssl_stream,
+                        SctpPacket {
+                            source_port: self.sctp_local_port,
+                            dest_port: self.sctp_remote_port,
+                            verification_tag: self.sctp_remote_verification_tag,
+                            chunks: &[SctpChunk::Abort],
+                        },
+                    )?;
+                    self.last_sent = Instant::now();
+                }
+                ssl_stream.shutdown().map_err(ssl_err_to_io_err)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Connection has either timed out or finished shutting down
@@ -103,10 +134,30 @@ impl Client {
         }
     }
 
-    /// Must be called at `CLIENT_UPDATE_INTERVAL` or faster, may produce heartbeat packets or
-    /// perform packet resends
-    pub fn update(&mut self) {
-        // unimplemented!
+    /// Must be called at `CLIENT_UPDATE_INTERVAL` or faster, may produce outgoing packets.
+    pub fn update(&mut self) -> Result<(), IoError> {
+        if self.last_sent.elapsed() > HEARTBEAT_INTERVAL {
+            match &mut self.ssl_state {
+                ClientSslState::Established(ssl_stream) => {
+                    if self.sctp_state == SctpState::Established {
+                        send_sctp_packet(
+                            ssl_stream,
+                            SctpPacket {
+                                source_port: self.sctp_local_port,
+                                dest_port: self.sctp_remote_port,
+                                verification_tag: self.sctp_remote_verification_tag,
+                                chunks: &[SctpChunk::Heartbeat {
+                                    heartbeat_info: None,
+                                }],
+                            },
+                        )?;
+                        self.last_sent = Instant::now();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
@@ -148,26 +199,29 @@ impl Client {
         }
 
         while let ClientSslState::Established(ssl_stream) = &mut self.ssl_state {
-            let mut ssl_buffer = ssl_stream.get_ref().buffer_pool.acquire();
-            ssl_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
-            match ssl_stream.ssl_read(&mut ssl_buffer) {
-                Ok(size) => {
-                    let mut sctp_chunks = [SctpChunk::Abort; SCTP_MAX_CHUNKS];
-                    match read_sctp_packet(&ssl_buffer[0..size], false, &mut sctp_chunks) {
-                        Ok(sctp_packet) => {
-                            self.receive_sctp_packet(&sctp_packet)
-                                .map_err(ssl_err_to_io_err)?;
-                        }
-                        Err(err) => {
-                            warn!("sctp error on packet received over DTLS: {:?}", err);
+            if ssl_stream.get_shutdown() == ShutdownState::RECEIVED {
+                self.ssl_state = ClientSslState::Unestablished(None);
+            } else {
+                let mut ssl_buffer = ssl_stream.get_ref().buffer_pool.acquire();
+                ssl_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
+                match ssl_stream.ssl_read(&mut ssl_buffer) {
+                    Ok(size) => {
+                        let mut sctp_chunks = [SctpChunk::Abort; SCTP_MAX_CHUNKS];
+                        match read_sctp_packet(&ssl_buffer[0..size], false, &mut sctp_chunks) {
+                            Ok(sctp_packet) => {
+                                self.receive_sctp_packet(&sctp_packet)?;
+                            }
+                            Err(err) => {
+                                warn!("sctp error on packet received over DTLS: {:?}", err);
+                            }
                         }
                     }
-                }
-                Err(err) => {
-                    if err.code() == ErrorCode::WANT_READ {
-                        break;
-                    } else {
-                        return Err(ssl_err_to_io_err(err));
+                    Err(err) => {
+                        if err.code() == ErrorCode::WANT_READ {
+                            break;
+                        } else {
+                            return Err(ssl_err_to_io_err(err));
+                        }
                     }
                 }
             }
@@ -190,17 +244,72 @@ impl Client {
         .flatten()
     }
 
-    fn receive_sctp_packet(&mut self, sctp_packet: &SctpPacket) -> Result<(), SslError> {
+    pub fn send_message(
+        &mut self,
+        message_type: RtcMessageType,
+        message: &[u8],
+    ) -> Result<(), IoError> {
         let ssl_stream = match &mut self.ssl_state {
             ClientSslState::Established(ssl_stream) => ssl_stream,
-            _ => panic!("receive sctp packet called in ssl unestablished state"),
+            _ => {
+                return Err(IoError::new(
+                    IoErrorKind::NotConnected,
+                    "cannot send WebRTC message, DTLS stream disconnected",
+                ))
+            }
         };
 
-        match self.sctp_state {
-            SctpState::Shutdown => match sctp_packet.chunks[0] {
+        if self.sctp_state != SctpState::Established {
+            return Err(IoError::new(
+                IoErrorKind::NotConnected,
+                "cannot send WebRTC message, SCTP connection not established",
+            ));
+        }
+
+        let proto_id = if message_type == RtcMessageType::Text {
+            DATA_CHANNEL_PROTO_STRING
+        } else {
+            DATA_CHANNEL_PROTO_BINARY
+        };
+
+        send_sctp_packet(
+            ssl_stream,
+            SctpPacket {
+                source_port: self.sctp_local_port,
+                dest_port: self.sctp_remote_port,
+                verification_tag: self.sctp_remote_verification_tag,
+                chunks: &[SctpChunk::Data {
+                    chunk_flags: SCTP_FLAG_COMPLETE_UNRELIABLE,
+                    tsn: self.sctp_local_tsn,
+                    stream_id: 0,
+                    stream_seq: 0,
+                    proto_id,
+                    user_data: message,
+                }],
+            },
+        )?;
+        self.sctp_local_tsn = self.sctp_local_tsn.wrapping_add(1);
+
+        Ok(())
+    }
+
+    pub fn receive_messages<'a>(
+        &'a mut self,
+    ) -> impl Iterator<Item = (RtcMessageType, PooledBuffer)> + 'a {
+        self.received_messages.drain(..)
+    }
+
+    fn receive_sctp_packet(&mut self, sctp_packet: &SctpPacket) -> Result<(), IoError> {
+        let ssl_stream = match &mut self.ssl_state {
+            ClientSslState::Established(ssl_stream) => ssl_stream,
+            _ => panic!("receive_sctp_packet called in ssl unestablished state"),
+        };
+
+        for chunk in sctp_packet.chunks {
+            match *chunk {
                 SctpChunk::Init {
                     initiate_tag,
-                    window_credit,
+                    window_credit: _,
                     num_outbound_streams,
                     num_inbound_streams,
                     initial_tsn,
@@ -216,65 +325,166 @@ impl Client {
                     self.sctp_local_tsn = rng.gen();
                     self.sctp_remote_tsn = initial_tsn;
 
-                    let init_ack = SctpPacket {
-                        source_port: self.sctp_local_port,
-                        dest_port: self.sctp_remote_port,
-                        verification_tag: self.sctp_remote_verification_tag,
-                        chunks: &[SctpChunk::InitAck {
-                            initiate_tag: self.sctp_local_verification_tag,
-                            window_credit: SCTP_WINDOW_CREDIT,
-                            num_outbound_streams: num_outbound_streams,
-                            num_inbound_streams: num_inbound_streams,
-                            initial_tsn: self.sctp_local_tsn,
-                            state_cookie: SCTP_COOKIE,
-                        }],
-                    };
-
-                    let mut sctp_buffer = ssl_stream.get_ref().buffer_pool.acquire();
-                    sctp_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
-
-                    let packet_len = write_sctp_packet(&mut sctp_buffer, init_ack)
-                        .expect("could not write SCTP InitAck packet");
-
-                    assert_eq!(
-                        ssl_stream.ssl_write(&sctp_buffer[0..packet_len])?,
-                        packet_len
-                    );
-
-                    self.sctp_state = SctpState::InitAck;
-                }
-                _ => {}
-            },
-            SctpState::InitAck => match sctp_packet.chunks[0] {
-                SctpChunk::CookieEcho { state_cookie } => {
-                    if state_cookie == SCTP_COOKIE {
-                        let cookie_ack = SctpPacket {
+                    send_sctp_packet(
+                        ssl_stream,
+                        SctpPacket {
                             source_port: self.sctp_local_port,
                             dest_port: self.sctp_remote_port,
                             verification_tag: self.sctp_remote_verification_tag,
-                            chunks: &[SctpChunk::CookieAck],
-                        };
+                            chunks: &[SctpChunk::InitAck {
+                                initiate_tag: self.sctp_local_verification_tag,
+                                window_credit: SCTP_BUFFER_SIZE,
+                                num_outbound_streams: num_outbound_streams,
+                                num_inbound_streams: num_inbound_streams,
+                                initial_tsn: self.sctp_local_tsn,
+                                state_cookie: SCTP_COOKIE,
+                            }],
+                        },
+                    )?;
 
-                        let mut sctp_buffer = ssl_stream.get_ref().buffer_pool.acquire();
-                        sctp_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
+                    self.sctp_state = SctpState::InitAck;
+                    self.last_activity = Instant::now();
+                    self.last_sent = Instant::now();
+                }
+                SctpChunk::CookieEcho { state_cookie } => {
+                    if state_cookie == SCTP_COOKIE && self.sctp_state != SctpState::Shutdown {
+                        send_sctp_packet(
+                            ssl_stream,
+                            SctpPacket {
+                                source_port: self.sctp_local_port,
+                                dest_port: self.sctp_remote_port,
+                                verification_tag: self.sctp_remote_verification_tag,
+                                chunks: &[SctpChunk::CookieAck],
+                            },
+                        )?;
+                        self.last_sent = Instant::now();
 
-                        let packet_len = write_sctp_packet(&mut sctp_buffer, cookie_ack)
-                            .expect("could not write SCTP CookieAck packet");
-
-                        assert_eq!(
-                            ssl_stream.ssl_write(&sctp_buffer[0..packet_len])?,
-                            packet_len
-                        );
-
-                        self.sctp_state = SctpState::Established;
+                        if self.sctp_state == SctpState::InitAck {
+                            self.sctp_state = SctpState::Established;
+                            self.last_activity = Instant::now();
+                        }
                     }
                 }
-                _ => {}
-            },
-            SctpState::Established => {
-                println!("Established state SCTP packet received: {:#?}", sctp_packet);
+                SctpChunk::Data {
+                    chunk_flags: _,
+                    tsn,
+                    stream_id,
+                    stream_seq: _,
+                    proto_id,
+                    user_data,
+                } => {
+                    self.sctp_remote_tsn = max_tsn(self.sctp_remote_tsn, tsn);
+
+                    if proto_id == DATA_CHANNEL_PROTO_CONTROL {
+                        if !user_data.is_empty() {
+                            if user_data[0] == DATA_CHANNEL_MESSAGE_OPEN {
+                                send_sctp_packet(
+                                    ssl_stream,
+                                    SctpPacket {
+                                        source_port: self.sctp_local_port,
+                                        dest_port: self.sctp_remote_port,
+                                        verification_tag: self.sctp_remote_verification_tag,
+                                        chunks: &[SctpChunk::Data {
+                                            chunk_flags: SCTP_FLAG_COMPLETE_UNRELIABLE,
+                                            tsn: self.sctp_local_tsn,
+                                            stream_id,
+                                            stream_seq: 0,
+                                            proto_id: DATA_CHANNEL_PROTO_CONTROL,
+                                            user_data: &[DATA_CHANNEL_MESSAGE_ACK],
+                                        }],
+                                    },
+                                )?;
+                                self.sctp_local_tsn = self.sctp_local_tsn.wrapping_add(1);
+                            }
+                        }
+                    } else if proto_id == DATA_CHANNEL_PROTO_STRING {
+                        let mut msg_buffer = ssl_stream.get_ref().buffer_pool.acquire();
+                        msg_buffer.extend(user_data);
+                        self.received_messages
+                            .push((RtcMessageType::Text, msg_buffer));
+                    } else if proto_id == DATA_CHANNEL_PROTO_BINARY {
+                        let mut msg_buffer = ssl_stream.get_ref().buffer_pool.acquire();
+                        msg_buffer.extend(user_data);
+                        self.received_messages
+                            .push((RtcMessageType::Text, msg_buffer));
+                    }
+
+                    send_sctp_packet(
+                        ssl_stream,
+                        SctpPacket {
+                            source_port: self.sctp_local_port,
+                            dest_port: self.sctp_remote_port,
+                            verification_tag: self.sctp_remote_verification_tag,
+                            chunks: &[SctpChunk::SAck {
+                                cumulative_tsn_ack: self.sctp_remote_tsn,
+                                adv_recv_window: SCTP_BUFFER_SIZE,
+                                num_gap_ack_blocks: 0,
+                                num_dup_tsn: 0,
+                            }],
+                        },
+                    )?;
+
+                    self.last_activity = Instant::now();
+                    self.last_sent = Instant::now();
+                }
+                SctpChunk::Heartbeat { heartbeat_info } => {
+                    send_sctp_packet(
+                        ssl_stream,
+                        SctpPacket {
+                            source_port: self.sctp_local_port,
+                            dest_port: self.sctp_remote_port,
+                            verification_tag: self.sctp_remote_verification_tag,
+                            chunks: &[SctpChunk::HeartbeatAck { heartbeat_info }],
+                        },
+                    )?;
+                    self.last_activity = Instant::now();
+                    self.last_sent = Instant::now();
+                }
+                SctpChunk::HeartbeatAck { .. } => {
+                    self.last_activity = Instant::now();
+                }
+                SctpChunk::SAck {
+                    cumulative_tsn_ack: _,
+                    adv_recv_window: _,
+                    num_gap_ack_blocks,
+                    num_dup_tsn: _,
+                } => {
+                    if num_gap_ack_blocks > 0 {
+                        send_sctp_packet(
+                            ssl_stream,
+                            SctpPacket {
+                                source_port: self.sctp_local_port,
+                                dest_port: self.sctp_remote_port,
+                                verification_tag: self.sctp_remote_verification_tag,
+                                chunks: &[SctpChunk::ForwardTsn {
+                                    new_cumulative_tsn: self.sctp_local_tsn,
+                                }],
+                            },
+                        )?;
+                        self.last_sent = Instant::now();
+                    }
+                    self.last_activity = Instant::now();
+                }
+                SctpChunk::Shutdown { .. } => {
+                    send_sctp_packet(
+                        ssl_stream,
+                        SctpPacket {
+                            source_port: self.sctp_local_port,
+                            dest_port: self.sctp_remote_port,
+                            verification_tag: self.sctp_remote_verification_tag,
+                            chunks: &[SctpChunk::ShutdownAck],
+                        },
+                    )?;
+                }
+                SctpChunk::ShutdownAck { .. } | SctpChunk::Abort => {
+                    self.sctp_state = SctpState::Shutdown;
+                    ssl_stream.shutdown().map_err(ssl_err_to_io_err)?;
+                }
+                SctpChunk::ForwardTsn { new_cumulative_tsn } => {
+                    self.sctp_remote_tsn = new_cumulative_tsn;
+                }
+                SctpChunk::InitAck { .. } | SctpChunk::CookieAck => {}
             }
-            SctpState::ShutdownSent { .. } => {}
         }
 
         Ok(())
@@ -324,17 +534,22 @@ impl Write for ClientSslPackets {
 }
 
 const SCTP_COOKIE: &[u8] = b"GAMERALOVESCOOKIES";
-const SHUTDOWN_RESEND: Duration = Duration::from_secs(1);
-const MAX_SHUTDOWN_PACKETS: i32 = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const SCTP_MAX_CHUNKS: usize = 16;
-const SCTP_WINDOW_CREDIT: u32 = 0x40000;
+const SCTP_BUFFER_SIZE: u32 = 0x40000;
 
+const DATA_CHANNEL_PROTO_CONTROL: u32 = 50;
+const DATA_CHANNEL_PROTO_STRING: u32 = 51;
+const DATA_CHANNEL_PROTO_BINARY: u32 = 53;
+
+const DATA_CHANNEL_MESSAGE_ACK: u8 = 2;
+const DATA_CHANNEL_MESSAGE_OPEN: u8 = 3;
+
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
 enum SctpState {
     Shutdown,
     InitAck,
     Established,
-    ShutdownSent { first_sent: Instant, num_sent: i32 },
 }
 
 fn ssl_err_to_io_err(err: SslError) -> IoError {
@@ -342,4 +557,48 @@ fn ssl_err_to_io_err(err: SslError) -> IoError {
         Ok(err) => err,
         Err(err) => IoError::new(IoErrorKind::Other, err),
     }
+}
+
+fn max_tsn(a: u32, b: u32) -> u32 {
+    if a > b {
+        if a - b < (1 << 31) {
+            a
+        } else {
+            b
+        }
+    } else {
+        if b - a < (1 << 31) {
+            b
+        } else {
+            a
+        }
+    }
+}
+
+fn send_sctp_packet(
+    ssl_stream: &mut SslStream<ClientSslPackets>,
+    sctp_packet: SctpPacket,
+) -> Result<(), IoError> {
+    let mut sctp_buffer = ssl_stream.get_ref().buffer_pool.acquire();
+    sctp_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
+
+    let packet_len = match write_sctp_packet(&mut sctp_buffer, sctp_packet) {
+        Ok(len) => len,
+        Err(SctpWriteError::BufferSize) => {
+            return Err(IoError::new(
+                IoErrorKind::InvalidData,
+                "SCTP packet too large",
+            ))
+        }
+        Err(err) => panic!("error writing SCTP packet: {}", err),
+    };
+
+    assert_eq!(
+        ssl_stream
+            .ssl_write(&sctp_buffer[0..packet_len])
+            .map_err(ssl_err_to_io_err)?,
+        packet_len
+    );
+
+    Ok(())
 }

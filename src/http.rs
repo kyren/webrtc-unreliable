@@ -49,6 +49,7 @@ pub fn create_http_server(
                         .and_then(move |_| {
                             let mut rng = thread_rng();
                             Response::builder()
+                                .header(header::CONTENT_TYPE, "application/json")
                                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                                 .body(Body::from(gen_sdp_response(
                                     &mut rng,

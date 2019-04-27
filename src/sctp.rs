@@ -124,13 +124,8 @@ pub fn read_sctp_packet<'a>(
         let chunk_flags = remaining_chunks[1];
         let chunk_len = NetworkEndian::read_u16(&remaining_chunks[2..4]);
 
-        let chunk_next = if chunk_len % 4 == 0 {
-            chunk_len
-        } else {
-            chunk_len - chunk_len % 4 + 4
-        };
-
-        if chunk_next as usize > remaining_chunks.len() || chunk_len < 4 {
+        let chunk_next = next_multiple(chunk_len as usize, 4);
+        if chunk_next > remaining_chunks.len() || chunk_len < 4 {
             return Err(SctpReadError::BadPacket);
         }
 
@@ -266,7 +261,7 @@ pub fn read_sctp_packet<'a>(
             _ => unimplemented!(),
         }
 
-        remaining_chunks = &remaining_chunks[chunk_next as usize..];
+        remaining_chunks = &remaining_chunks[chunk_next..];
         chunk_count += 1;
     }
 
@@ -337,7 +332,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 NetworkEndian::write_u16(&mut chunk_data[4..6], stream_id);
                 NetworkEndian::write_u16(&mut chunk_data[6..8], stream_seq);
                 NetworkEndian::write_u32(&mut chunk_data[8..12], proto_id);
-                chunk_data[12..].copy_from_slice(user_data);
+                chunk_data[12..12 + user_data.len()].copy_from_slice(user_data);
 
                 (CHUNK_TYPE_DATA, chunk_flags, data_len)
             }
@@ -466,16 +461,11 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
             }
         };
 
-        let data_len = if data_len % 4 == 0 {
-            data_len
-        } else {
-            let len = data_len - data_len % 4 + 4;
-            for i in data_len..len {
-                chunk_data[i] = 0;
-            }
-            len
-        };
-        let chunk_len = data_len + 4;
+        let data_padded_len = next_multiple(data_len, 4);
+        for i in data_len..data_padded_len {
+            chunk_data[i] = 0;
+        }
+        let chunk_len = data_padded_len + 4;
 
         chunk_header[0] = chunk_type;
         chunk_header[1] = chunk_flags;
@@ -512,3 +502,11 @@ const CHUNK_TYPE_FORWARD_TSN: u8 = 0xc0;
 
 const INIT_ACK_PARAM_STATE_COOKIE: u16 = 0x07;
 const HEARTBEAT_PARAM_INFO: u16 = 0x07;
+
+fn next_multiple(s: usize, m: usize) -> usize {
+    if s % m == 0 {
+        s
+    } else {
+        s - s % m + m
+    }
+}

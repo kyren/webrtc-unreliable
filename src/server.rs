@@ -2,7 +2,7 @@ use std::{
     collections::{hash_map::Entry as HashMapEntry, HashMap, VecDeque},
     error::Error,
     fmt,
-    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write},
+    io::{Error as IoError, ErrorKind as IoErrorKind},
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -13,37 +13,31 @@ use openssl::ssl::SslAcceptor;
 use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::client::{Client, CLIENT_UPDATE_INTERVAL, MAX_UDP_PAYLOAD_SIZE};
+use crate::client::{RtcClient, RtcMessageType, CLIENT_UPDATE_INTERVAL, MAX_UDP_PAYLOAD_SIZE};
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
 
 /// After no indication of a working connection for this amount of time, a client will be considered
 /// timed out and disconnected.
-pub const SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 pub enum RtcSendError {
     IoError(IoError),
-    DisconnectedClient,
+    ClientNotConnected,
 }
 
 impl fmt::Display for RtcSendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
             RtcSendError::IoError(err) => fmt::Display::fmt(err, f),
-            RtcSendError::DisconnectedClient => write!(f, "RTC Client is no longer connected"),
+            RtcSendError::ClientNotConnected => write!(f, "WebRTC client is not connected"),
         }
     }
 }
 
 impl Error for RtcSendError {}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum RtcMessageType {
-    Text,
-    Binary,
-}
 
 #[derive(Copy, Clone, Debug)]
 pub struct RtcMessageResult {
@@ -104,18 +98,28 @@ impl RtcServer {
 
     pub fn send(
         &mut self,
-        message: &[u8],
-        message_type: RtcMessageType,
         remote_addr: &SocketAddr,
+        message_type: RtcMessageType,
+        message: &[u8],
     ) -> Poll<(), RtcSendError> {
         try_ready!(self.send_udp().map_err(RtcSendError::IoError));
 
-        let client_state = self
+        let client = self
             .connected_clients
             .get_mut(remote_addr)
-            .ok_or(RtcSendError::DisconnectedClient)?;
+            .ok_or(RtcSendError::ClientNotConnected)?;
 
-        unimplemented!();
+        if !client.is_established() {
+            return Err(RtcSendError::ClientNotConnected)?;
+        }
+
+        client
+            .send_message(message_type, message)
+            .map_err(RtcSendError::IoError)?;
+        self.outgoing_udp
+            .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
+
+        try_ready!(self.send_udp().map_err(RtcSendError::IoError));
 
         Ok(Async::Ready(()))
     }
@@ -186,6 +190,12 @@ impl RtcServer {
             self.pending_clients
                 .retain(|_, pending_client| pending_client.created.elapsed() < SESSION_TIMEOUT);
 
+            for (remote_addr, client) in &mut self.connected_clients {
+                if let Err(err) = client.update() {
+                    warn!("remote host {:?} error: {}", remote_addr, err);
+                }
+            }
+
             let outgoing_udp = &mut self.outgoing_udp;
             self.connected_clients.retain(|&remote_addr, client| {
                 if !client.is_shutdown() && client.last_activity().elapsed() < SESSION_TIMEOUT {
@@ -195,9 +205,9 @@ impl RtcServer {
                     false
                 }
             });
-
-            self.send_udp()?;
         }
+
+        self.send_udp()?;
 
         Ok(())
     }
@@ -244,6 +254,11 @@ impl RtcServer {
                 }
                 self.outgoing_udp
                     .extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
+                self.incoming_rtc.extend(
+                    client
+                        .receive_messages()
+                        .map(|(message_type, message)| (message, remote_addr, message_type)),
+                );
             }
             HashMapEntry::Vacant(vacant) => {
                 if let Some(stun_binding_request) =
@@ -265,8 +280,12 @@ impl RtcServer {
                         self.outgoing_udp.push_back((packet_buffer, remote_addr));
 
                         vacant.insert(
-                            Client::new(&self.ssl_acceptor, self.buffer_pool.clone(), remote_addr)
-                                .expect("could not start DTLS handshake"),
+                            RtcClient::new(
+                                &self.ssl_acceptor,
+                                self.buffer_pool.clone(),
+                                remote_addr,
+                            )
+                            .expect("could not start DTLS handshake"),
                         );
                     }
                 }
@@ -292,4 +311,4 @@ struct PendingClient {
 }
 
 type PendingClients = HashMap<PendingClientKey, PendingClient>;
-type ConnectedClients = HashMap<SocketAddr, Client>;
+type ConnectedClients = HashMap<SocketAddr, RtcClient>;

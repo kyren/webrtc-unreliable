@@ -2,6 +2,7 @@ use clap::{App, Arg};
 use futures::{future, Async, Future};
 use tokio::runtime::Runtime;
 
+use log::warn;
 use rtcdata::{RtcMessageResult, RtcSendError, RtcServer};
 
 fn main() {
@@ -64,9 +65,9 @@ fn main() {
             let mut work_done = false;
             if let Some(last) = last_message.take() {
                 match rtc_server.send(
-                    &message_buf[0..last.message_len],
-                    last.message_type,
                     &last.remote_addr,
+                    last.message_type,
+                    &message_buf[0..last.message_len],
                 ) {
                     Ok(Async::Ready(())) => {
                         work_done = true;
@@ -74,8 +75,10 @@ fn main() {
                     Ok(Async::NotReady) => {
                         last_message = Some(last);
                     }
-                    Err(RtcSendError::DisconnectedClient) => {}
-                    Err(RtcSendError::IoError(err)) => panic!(err),
+                    Err(RtcSendError::ClientNotConnected) => {}
+                    Err(RtcSendError::IoError(err)) => {
+                        warn!("could not send message to {:?}: {}", last.remote_addr, err)
+                    }
                 }
             }
 
