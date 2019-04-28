@@ -166,9 +166,17 @@ impl RtcClient {
     }
 
     /// Connection has either timed out or finished shutting down
-    pub fn is_shutdown(&self) -> bool {
-        match &self.ssl_state {
+    pub fn is_shutdown(&mut self) -> bool {
+        match &mut self.ssl_state {
             ClientSslState::Unestablished(None) => true,
+            ClientSslState::Shutdown(ssl_stream) => {
+                if ssl_stream.get_shutdown().contains(ShutdownState::RECEIVED) {
+                    self.ssl_state = ClientSslState::Unestablished(None);
+                    true
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
