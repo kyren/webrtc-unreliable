@@ -3,7 +3,7 @@ use futures::{future, Async, Future};
 use tokio::runtime::Runtime;
 
 use log::warn;
-use rtcdata::{RtcError, RtcMessageResult, RtcServer};
+use webrtc_unreliable::{RtcError, RtcMessageResult, RtcServer};
 
 fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -58,42 +58,36 @@ fn main() {
     let mut rtc_server = RtcServer::new(http_listen_addr, udp_listen_addr, public_udp_addr)
         .expect("could not start RTC server");
     let mut message_buf = vec![0; 0x10000];
-    let mut last_message: Option<RtcMessageResult> = None;
+    let mut received_message: Option<RtcMessageResult> = None;
 
     runtime.spawn(Box::new(future::poll_fn(move || loop {
-        let mut work_done = false;
-
-        if last_message.is_none() {
-            match rtc_server.poll_recv(&mut message_buf) {
-                Ok(Async::Ready(incoming_message)) => {
-                    work_done = true;
-                    last_message = Some(incoming_message);
+        match received_message.take() {
+            Some(received) => {
+                match rtc_server.poll_send(
+                    &message_buf[0..received.message_len],
+                    received.message_type,
+                    &received.remote_addr,
+                ) {
+                    Ok(Async::Ready(())) => {}
+                    Ok(Async::NotReady) => {
+                        received_message = Some(received);
+                        return Ok(Async::NotReady);
+                    }
+                    Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
+                    Err(err) => warn!(
+                        "could not send message to {:?}: {}",
+                        received.remote_addr, err
+                    ),
                 }
-                Ok(Async::NotReady) => {}
+            }
+            None => match rtc_server.poll_recv(&mut message_buf) {
+                Ok(Async::Ready(incoming_message)) => {
+                    received_message = Some(incoming_message);
+                }
+                Ok(Async::NotReady) => return Ok(Async::NotReady),
                 Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
                 Err(err) => warn!("could not receive RTC message: {}", err),
-            }
-        }
-
-        if let Some(last) = last_message.take() {
-            match rtc_server.poll_send(
-                &message_buf[0..last.message_len],
-                last.message_type,
-                &last.remote_addr,
-            ) {
-                Ok(Async::Ready(())) => {
-                    work_done = true;
-                }
-                Ok(Async::NotReady) => {
-                    last_message = Some(last);
-                }
-                Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
-                Err(err) => warn!("could not send message to {:?}: {}", last.remote_addr, err),
-            }
-        }
-
-        if !work_done {
-            return Ok(Async::NotReady);
+            },
         }
     })));
 
