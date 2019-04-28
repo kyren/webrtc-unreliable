@@ -13,9 +13,7 @@ use openssl::ssl::SslAcceptor;
 use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::client::{
-    RtcClient, RtcClientError, RtcMessageType, CLIENT_UPDATE_INTERVAL, MAX_UDP_PAYLOAD_SIZE,
-};
+use crate::client::{RtcClient, RtcClientError, RtcMessageType, MAX_UDP_PAYLOAD_SIZE};
 use crate::crypto::Crypto;
 use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
@@ -97,8 +95,9 @@ pub struct RtcServer {
     buffer_pool: BufferPool,
     ice_clients: HashMap<IceClientKey, IceClient>,
     rtc_clients: HashMap<SocketAddr, RtcClient>,
-    last_client_update: Instant,
-    update_timer: Interval,
+    last_generate_periodic: Instant,
+    last_cleanup: Instant,
+    periodic_timer: Interval,
 }
 
 impl RtcServer {
@@ -128,8 +127,9 @@ impl RtcServer {
             buffer_pool: BufferPool::new(),
             ice_clients: HashMap::new(),
             rtc_clients: HashMap::new(),
-            last_client_update: Instant::now(),
-            update_timer: Interval::new_interval(CLIENT_UPDATE_INTERVAL),
+            last_generate_periodic: Instant::now(),
+            last_cleanup: Instant::now(),
+            periodic_timer: Interval::new_interval(PERIODIC_TIMER_INTERVAL),
         })
     }
 
@@ -158,12 +158,16 @@ impl RtcServer {
         }
     }
 
+    /// Send the given message to the given remote client, if they are connected.  Not all work will
+    /// necessarily be done by this call, so calls to `RtcServer::send` should be followed by a call
+    /// `RtcServer::process`.
     pub fn send(
         &mut self,
-        remote_addr: &SocketAddr,
-        message_type: RtcMessageType,
         message: &[u8],
+        message_type: RtcMessageType,
+        remote_addr: &SocketAddr,
     ) -> Poll<(), RtcError> {
+        // Send pending UDP messages before potentially buffering new ones
         try_ready!(self.send_udp());
 
         let client = self
@@ -198,8 +202,12 @@ impl RtcServer {
         Ok(Async::Ready(()))
     }
 
+    /// Receive a WebRTC data channel message from any connected client.
     pub fn receive(&mut self, buf: &mut [u8]) -> Poll<RtcMessageResult, RtcError> {
         while self.incoming_rtc.is_empty() {
+            // Receiving incoming UDP packets can lead to the production of new outgoing UDP
+            // packets, so to keep the queue usage constant, we also make sure to send any pending
+            // outgoing UDP packets in addition to receiving incoming ones.
             try_ready!(self.send_udp());
             try_ready!(self.receive_udp());
         }
@@ -221,6 +229,12 @@ impl RtcServer {
         }))
     }
 
+    /// Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, and finishes
+    /// sending any outgoing messages.  Should be called on every Task wakeup after any calls to
+    /// `RtcServer::send` or `RtcServer::receive`.
+    ///
+    /// Always registers the current Task for notification, acts as a poll method that always
+    /// returns Async::NotReady.
     pub fn process(&mut self) -> Result<(), RtcInternalError> {
         if self
             .http_server
@@ -257,24 +271,8 @@ impl RtcServer {
             }
         }
 
-        loop {
-            match self.update_timer.poll() {
-                Ok(Async::Ready(val)) => {
-                    val.expect("interval stream should not stop");
-                }
-                Ok(Async::NotReady) => break,
-                Err(err) => {
-                    if err.is_shutdown() {
-                        return Err(RtcInternalError::Other(
-                            "update timer has unexpectedly shutdown".into(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        if self.last_client_update.elapsed() >= CLIENT_UPDATE_INTERVAL {
-            self.last_client_update = Instant::now();
+        if self.last_cleanup.elapsed() >= CLEANUP_INTERVAL {
+            self.last_cleanup = Instant::now();
             self.ice_clients.retain(|ice_client_key, ice_client| {
                 if ice_client.ttl.elapsed() < ICE_SESSION_TIMEOUT {
                     true
@@ -287,17 +285,8 @@ impl RtcServer {
                 }
             });
 
-            for (remote_addr, client) in &mut self.rtc_clients {
-                if let Err(err) = client.update() {
-                    warn!("error for client {:?}, shutting down: {}", remote_addr, err);
-                    let _ = client.start_shutdown();
-                }
-            }
-
-            let outgoing_udp = &mut self.outgoing_udp;
-            self.rtc_clients.retain(|&remote_addr, client| {
+            self.rtc_clients.retain(|remote_addr, client| {
                 if !client.is_shutdown() && client.last_activity().elapsed() < RTC_SESSION_TIMEOUT {
-                    outgoing_udp.extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
                     true
                 } else {
                     if !client.is_shutdown() {
@@ -309,12 +298,37 @@ impl RtcServer {
             });
         }
 
-        self.send_udp()?;
+        loop {
+            match self.periodic_timer.poll() {
+                Ok(Async::Ready(val)) => {
+                    val.expect("interval stream should not stop");
+                }
+                Ok(Async::NotReady) => break,
+                Err(err) => {
+                    if err.is_shutdown() {
+                        return Err(RtcInternalError::Other(
+                            "periodic timer has unexpectedly shutdown".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if self.send_udp()?.is_ready() {
+            self.receive_udp()?;
+        }
 
         Ok(())
     }
 
+    // Send any currently queued UDP packets, or if there are currently none queued generate any
+    // required periodic UDP packets and send those.  Returns Async::Ready if all queued UDP packets
+    // were sent and the queue is now empty.
     fn send_udp(&mut self) -> Poll<(), RtcInternalError> {
+        if self.outgoing_udp.is_empty() {
+            self.generate_periodic_packets()?;
+        }
+
         while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
             match self
                 .udp_socket
@@ -340,6 +354,8 @@ impl RtcServer {
         Ok(Async::Ready(()))
     }
 
+    // Handle incoming UDP packets, filling the incoming UDP queue and potentially responding to
+    // STUN requests.
     fn receive_udp(&mut self) -> Poll<(), RtcInternalError> {
         let mut packet_buffer = self.buffer_pool.acquire();
         packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
@@ -407,10 +423,30 @@ impl RtcServer {
 
         Ok(Async::Ready(()))
     }
+
+    // Call `RtcClient::generate_periodic` on all clients, if we are due to do so.
+    fn generate_periodic_packets(&mut self) -> Result<(), RtcInternalError> {
+        if self.last_generate_periodic.elapsed() >= PERIODIC_PACKET_INTERVAL {
+            self.last_generate_periodic = Instant::now();
+
+            for (remote_addr, client) in &mut self.rtc_clients {
+                if let Err(err) = client.generate_periodic() {
+                    warn!("error for client {:?}, shutting down: {}", remote_addr, err);
+                    let _ = client.start_shutdown();
+                }
+                self.outgoing_udp
+                    .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
+            }
+        }
+        Ok(())
+    }
 }
 
 const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const ICE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
+const PERIODIC_PACKET_INTERVAL: Duration = Duration::from_secs(1);
+const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct IceClientKey {

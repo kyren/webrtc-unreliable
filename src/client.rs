@@ -25,8 +25,9 @@ use crate::sctp::{
     SCTP_FLAG_COMPLETE_UNRELIABLE,
 };
 
-/// Maximum time between calls to `RtcClient::update`
-pub const CLIENT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+/// Heartbeat packets will be generated at a maximum of this rate (if the connection is otherwise
+/// idle).
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 // TODO: I'm not sure whether this is correct
 pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
@@ -172,8 +173,8 @@ impl RtcClient {
         }
     }
 
-    /// Must be called at `CLIENT_UPDATE_INTERVAL` or faster, may produce outgoing packets.
-    pub fn update(&mut self) -> Result<(), RtcClientError> {
+    /// Generate any periodic packets, currently only heartbeat packets.
+    pub fn generate_periodic(&mut self) -> Result<(), RtcClientError> {
         // We send heartbeat packets if the last sent packet was more than HEARTBEAT_INTERVAL ago
         if self.last_sent.elapsed() > HEARTBEAT_INTERVAL {
             match &mut self.ssl_state {
@@ -573,7 +574,6 @@ impl Write for ClientSslPackets {
 }
 
 const SCTP_COOKIE: &[u8] = b"GAMERALOVESCOOKIES";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const SCTP_MAX_CHUNKS: usize = 16;
 const SCTP_BUFFER_SIZE: u32 = 0x40000;
 

@@ -65,9 +65,9 @@ fn main() {
             let mut work_done = false;
             if let Some(last) = last_message.take() {
                 match rtc_server.send(
-                    &last.remote_addr,
-                    last.message_type,
                     &message_buf[0..last.message_len],
+                    last.message_type,
+                    &last.remote_addr,
                 ) {
                     Ok(Async::Ready(())) => {
                         work_done = true;
