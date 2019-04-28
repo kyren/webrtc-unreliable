@@ -31,7 +31,7 @@ pub enum RtcError {
     /// Non-fatal error writing a WebRTC Data Channel message that is too large to fit in the
     /// maximum message size.
     IncompleteMessageWrite,
-    /// Other generally fatal internal error
+    /// Other generally fatal internal errors.
     Internal(RtcInternalError),
 }
 
