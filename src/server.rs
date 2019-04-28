@@ -390,6 +390,11 @@ impl RtcServer {
 
                 match self.rtc_clients.entry(remote_addr) {
                     HashMapEntry::Vacant(vacant) => {
+                        info!(
+                            "beginning client WebRTC data channel connection with {:?}",
+                            remote_addr,
+                        );
+
                         vacant.insert(
                             RtcClient::new(
                                 &self.ssl_acceptor,

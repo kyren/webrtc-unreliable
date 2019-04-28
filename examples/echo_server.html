@@ -1,0 +1,87 @@
+<html>
+<head>
+    <title>WebRTC Data Channel Echo Server Example</title>
+    <script>
+        let PORT = 9555;
+        let NUM_PACKETS = 20;
+        let SEND_INTERVAL = 500;
+        let ADDRESS = window.location.protocol + "//" + window.location.hostname + ":" + PORT
+
+        let peer = new RTCPeerConnection({
+            iceServers: [{
+                urls: ["stun:stun.l.google.com:19302"]
+            }]
+        });
+        let channel = peer.createDataChannel("webudp", {
+            ordered: false,
+            maxRetransmits: 0
+        });
+        channel.binaryType = "arraybuffer";
+
+        let send_times = {};
+        channel.onopen = function() {
+            console.log("data channel open");
+
+            let packet_number = 0
+            let cancel = setInterval(function() {
+                if (packet_number == NUM_PACKETS) {
+                    clearInterval(cancel);
+                    console.log("closing connection");
+                    peer.close();
+                } else {
+                    packet_number++
+                    console.log("sending packet", packet_number);
+                    channel.send(packet_number);
+                    send_times[packet_number] = Date.now();
+                }
+            }, SEND_INTERVAL);
+
+            channel.onmessage = function(evt) {
+                console.log(
+                    "received packet",
+                    evt.data,
+                    "in " + (Date.now() - send_times[Number(evt.data)]) + " ms"
+                );
+            };
+        };
+
+        channel.onerror = function(evt) {
+            console.log("data channel error:", evt.message);
+        };
+
+        peer.onicecandidate = function(evt) {
+            if (evt.candidate) {
+                console.log("received ice candidate", evt.candidate);
+            } else {
+                console.log("all local candidates received");
+            }
+        };
+
+        peer.createOffer().then(function(offer) {
+            return peer.setLocalDescription(offer);
+        }).then(function() {
+            var request = new XMLHttpRequest();
+            request.open("POST", ADDRESS);
+            request.onload = function() {
+                if (request.status == 200) {
+                    var response = JSON.parse(request.responseText);
+                    peer.setRemoteDescription(new RTCSessionDescription(response.answer)).then(function() {
+                        var candidate = new RTCIceCandidate(response.candidate);
+                        peer.addIceCandidate(candidate).then(function() {
+                            console.log("add ice candidate success");
+                        }).catch(function(err) {
+                            console.log("error during 'addIceCandidate':", err);
+                        });
+                    }).catch(function(e) {
+                        console.log("error during 'setRemoteDescription':", e);
+                    });
+                }
+            };
+            request.send(peer.localDescription.sdp);
+        }).catch(function(reason) {
+            console.log("error during 'createOffer':", reason);
+        });
+    </script>
+</head>
+<body></body>
+</html>
