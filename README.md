@@ -4,8 +4,8 @@ Connections (AKA Hacking the crap out of
 WebRTC)](http://www.stormbrewers.com/blog/webrtc-data-channels-without-signaling-aka-hacking-the-crap-out-of-webrtc/)
 
 Allows you to write a game server in rust with browser based clients and
-UDP-like networking.  Uses hyper, tokio, and openssl internally and provides a
-futures API to the server.
+UDP-like networking.  Uses hyper, tokio, and openssl internally and provides an
+external futures API.
 
 This crate supports many of the necessary protocols in WebRTC to the *barest
 minimum*.  You should expect ONLY WebRTC data channels to function, and only in
