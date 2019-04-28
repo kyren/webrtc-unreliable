@@ -62,18 +62,16 @@ fn main() {
 
     runtime.spawn(Box::new(future::poll_fn(move || {
         loop {
-            let mut work_done = false;
             if let Some(last) = last_message.take() {
-                match rtc_server.send(
+                match rtc_server.poll_send(
                     &message_buf[0..last.message_len],
                     last.message_type,
                     &last.remote_addr,
                 ) {
-                    Ok(Async::Ready(())) => {
-                        work_done = true;
-                    }
+                    Ok(Async::Ready(())) => {}
                     Ok(Async::NotReady) => {
                         last_message = Some(last);
+                        break;
                     }
                     Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
                     Err(err) => warn!("could not send message to {:?}: {}", last.remote_addr, err),
@@ -81,21 +79,16 @@ fn main() {
             }
 
             if last_message.is_none() {
-                match rtc_server.receive(&mut message_buf) {
+                match rtc_server.poll_recv(&mut message_buf) {
                     Ok(Async::Ready(incoming_message)) => {
                         last_message = Some(incoming_message);
-                        work_done = true;
                     }
-                    Ok(Async::NotReady) => {}
+                    Ok(Async::NotReady) => break,
                     Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
                     Err(err) => warn!("could not receive RTC message: {}", err),
                 }
             }
-            if !work_done {
-                break;
-            }
         }
-        rtc_server.process().expect("internal WebRTC server error");
 
         Ok(Async::NotReady)
     })));

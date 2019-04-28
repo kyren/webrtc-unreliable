@@ -158,10 +158,8 @@ impl RtcServer {
         }
     }
 
-    /// Send the given message to the given remote client, if they are connected.  Not all work will
-    /// necessarily be done by this call, so calls to `RtcServer::send` should be followed by a call
-    /// `RtcServer::process`.
-    pub fn send(
+    /// Send the given message to the given remote client, if they are connected.
+    pub fn poll_send(
         &mut self,
         message: &[u8],
         message_type: RtcMessageType,
@@ -199,17 +197,17 @@ impl RtcServer {
         self.outgoing_udp
             .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
 
-        Ok(Async::Ready(()))
+        Ok(self.send_udp()?)
     }
 
     /// Receive a WebRTC data channel message from any connected client.
-    pub fn receive(&mut self, buf: &mut [u8]) -> Poll<RtcMessageResult, RtcError> {
+    ///
+    /// `poll_recv` *must* be called until it returns Async::NotReady for proper operation of the
+    /// server, as it also handles background tasks such as responding to STUN packets, timing out
+    /// existing sessions, and handling HTTP requests.
+    pub fn poll_recv(&mut self, buf: &mut [u8]) -> Poll<RtcMessageResult, RtcError> {
         while self.incoming_rtc.is_empty() {
-            // Receiving incoming UDP packets can lead to the production of new outgoing UDP
-            // packets, so to keep the queue usage constant, we also make sure to send any pending
-            // outgoing UDP packets in addition to receiving incoming ones.
-            try_ready!(self.send_udp());
-            try_ready!(self.receive_udp());
+            try_ready!(self.process());
         }
 
         let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
@@ -229,13 +227,9 @@ impl RtcServer {
         }))
     }
 
-    /// Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, and finishes
-    /// sending any outgoing messages.  Should be called on every Task wakeup after any calls to
-    /// `RtcServer::send` or `RtcServer::receive`.
-    ///
-    /// Always registers the current Task for notification, acts as a poll method that always
-    /// returns Async::NotReady.
-    pub fn process(&mut self) -> Result<(), RtcInternalError> {
+    // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
+    // packets, receives incoming UDP packets, and responds to STUN packets.
+    fn process(&mut self) -> Poll<(), RtcInternalError> {
         if self
             .http_server
             .poll()
@@ -314,11 +308,8 @@ impl RtcServer {
             }
         }
 
-        if self.send_udp()?.is_ready() {
-            self.receive_udp()?;
-        }
-
-        Ok(())
+        try_ready!(self.send_udp());
+        Ok(self.receive_udp()?)
     }
 
     // Send any currently queued UDP packets, or if there are currently none queued generate any
