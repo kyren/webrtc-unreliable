@@ -55,6 +55,7 @@ pub fn create_http_server(
                                     &mut rng,
                                     &cert_fingerprint,
                                     &udp_addr.ip().to_string(),
+                                    udp_addr.ip().is_ipv6(),
                                     udp_addr.port(),
                                     &server_user,
                                     &server_passwd,

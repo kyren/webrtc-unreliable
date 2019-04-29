@@ -81,6 +81,7 @@ pub fn gen_sdp_response<R: Rng>(
     rng: &mut R,
     cert_fingerprint: &str,
     server_ip: &str,
+    server_is_ipv6: bool,
     server_port: u16,
     ufrag: &str,
     pass: &str,
@@ -88,11 +89,11 @@ pub fn gen_sdp_response<R: Rng>(
 ) -> String {
     format!(
         "{{\"answer\":{{\"sdp\":\"v=0\\r\\n\
-         o=- {rand1} 1 IN IP4 {port}\\r\\n\
+         o=- {rand1} 1 IN {ipv} {port}\\r\\n\
          s=-\\r\\n\
          t=0 0\\r\\n\
          m=application {port} UDP/DTLS/SCTP webrtc-datachannel\\r\\n\
-         c=IN IP4 {ip}\\r\\n\
+         c=IN {ipv} {ip}\\r\\n\
          a=ice-lite\\r\\n\
          a=ice-ufrag:{ufrag}\\r\\n\
          a=ice-pwd:{pass}\\r\\n\
@@ -112,5 +113,6 @@ pub fn gen_sdp_response<R: Rng>(
         ufrag = ufrag,
         pass = pass,
         mid = remote_mid,
+        ipv = if server_is_ipv6 { "IP6" } else { "IP4" },
     )
 }
