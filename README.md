@@ -1,3 +1,5 @@
+[![Build Status](https://img.shields.io/circleci/project/github/kyren/webrtc-unreliable.svg)](https://circleci.com/gh/kyren/webrtc-unreliable)
+
 This is Rust port of the [WebUDP](https://github.com/seemk/WebUdp) project,
 which is itself similar to the ideas presented in the article [Simplifying
 WebRTC Connections (AKA Hacking the crap out of
