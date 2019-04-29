@@ -7,7 +7,7 @@ description = "UDP-like (unreliable, unordered) communication between Javascript
 repository = "https://github.com/kyren/webrtc-unreliable"
 documentation = "https://docs.rs/webrtc-unreliable"
 readme = "README.md"
-keywords = ["wasm" "webrtc"]
+keywords = ["wasm", "webrtc"]
 license = "MIT"
 
 [dependencies]
