@@ -20,5 +20,10 @@ let
   };
 in
   mkShell rec {
-    buildInputs = [ rust pkg-config openssl ];
+    buildInputs = [
+      pkg-config
+      openssl
+      rust
+      hyp
+    ];
   }
