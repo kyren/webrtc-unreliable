@@ -581,7 +581,7 @@ impl Write for ClientSslPackets {
     }
 }
 
-const SCTP_COOKIE: &[u8] = b"GAMERALOVESCOOKIES";
+const SCTP_COOKIE: &[u8] = b"WEBRTC-UNRELIABLE-COOKIE";
 const SCTP_MAX_CHUNKS: usize = 16;
 const SCTP_BUFFER_SIZE: u32 = 0x40000;
 
