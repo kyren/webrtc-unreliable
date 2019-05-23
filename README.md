@@ -15,3 +15,7 @@ WebRTC data channel messages from multiple clients.
 This crate supports many of the necessary protocols in WebRTC to the *barest
 minimum*.  You should expect ONLY WebRTC data channels to function, and only in
 unreliable, unordered mode.
+
+## License
+
+This project is licensed under the [MIT license](LICENSE)
