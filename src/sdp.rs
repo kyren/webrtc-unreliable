@@ -1,7 +1,6 @@
 use std::{error, str};
 
 use futures::{future, Future, Stream};
-use hyper::Body;
 use rand::Rng;
 
 pub type Error = Box<error::Error + Send + Sync>;
@@ -13,7 +12,12 @@ pub struct SdpFields {
     pub mid: String,
 }
 
-pub fn parse_sdp_fields(body: Body) -> impl Future<Item = SdpFields, Error = Error> {
+pub fn parse_sdp_fields<I, E, S>(body: S) -> impl Future<Item = SdpFields, Error = Error>
+where
+    I: AsRef<[u8]>,
+    S: Stream<Item = I, Error = E>,
+    E: error::Error + Send + Sync + 'static,
+{
     const MAX_SDP_LINE: usize = 512;
 
     #[derive(Default, Debug)]
@@ -38,7 +42,7 @@ pub fn parse_sdp_fields(body: Body) -> impl Future<Item = SdpFields, Error = Err
         .fold(
             MaybeSdpFields::default(),
             move |mut fields, chunk| -> Result<_, Error> {
-                for c in chunk {
+                for &c in chunk.as_ref() {
                     if c == b'\r' || c == b'\n' {
                         if !line_buf.is_empty() {
                             if let Some(ice_ufrag) = after_prefix(&line_buf, b"a=ice-ufrag:") {

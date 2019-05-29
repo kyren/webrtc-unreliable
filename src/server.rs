@@ -8,7 +8,8 @@ use std::{
 };
 
 use futures::{sync::mpsc, try_ready, Async, Future, Poll, Sink, Stream};
-use hyper::{header, service::service_fn, Body, Response, Server};
+use http::Response;
+use hyper::{header, service::service_fn, Body, Server};
 use log::{info, warn};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
@@ -91,12 +92,20 @@ pub struct RtcMessageResult {
 pub struct SessionRequest(SdpFields);
 
 impl SessionRequest {
-    fn parse(body: Body) -> impl Future<Item = SessionRequest, Error = BoxError> {
-        parse_sdp_fields(body).map(SessionRequest)
+    /// Parse a SessionRequest from a stream of chunks.
+    ///
+    /// Parses using a constant amount of memory no matter the total size of the stream.
+    fn stream_parse<I, E, S>(stream: S) -> impl Future<Item = SessionRequest, Error = BoxError>
+    where
+        I: AsRef<[u8]>,
+        S: Stream<Item = I, Error = E>,
+        E: Error + Send + Sync + 'static,
+    {
+        parse_sdp_fields(stream).map(SessionRequest)
     }
 }
 
-pub type SessionResponse = Response<Body>;
+pub type SessionResponse = Response<String>;
 
 pub struct RtcServer {
     udp_socket: UdpSocket,
@@ -178,7 +187,7 @@ impl RtcServer {
                 service_fn(move |req| {
                     let cert_fingerprint = cert_fingerprint.clone();
                     let session_sender = session_sender.clone();
-                    SessionRequest::parse(req.into_body()).and_then(move |session_request| {
+                    SessionRequest::stream_parse(req.into_body()).and_then(move |session_request| {
                         let (incoming_session, response) = handle_session_request(
                             public_webrtc_addr,
                             &cert_fingerprint,
@@ -187,7 +196,7 @@ impl RtcServer {
                         session_sender
                             .send(incoming_session)
                             .map_err(BoxError::from)
-                            .map(move |_| response)
+                            .map(move |_| response.map(Body::from))
                     })
                 })
             })
@@ -542,7 +551,7 @@ fn handle_session_request(
     public_webrtc_addr: SocketAddr,
     cert_fingerprint: &str,
     session_request: SessionRequest,
-) -> (IncomingSession, Response<Body>) {
+) -> (IncomingSession, SessionResponse) {
     const SERVER_USER_LEN: usize = 8;
     const SERVER_PASSWD_LEN: usize = 24;
 
@@ -560,7 +569,7 @@ fn handle_session_request(
     let response = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(Body::from(gen_sdp_response(
+        .body(gen_sdp_response(
             &mut rng,
             &cert_fingerprint,
             &public_webrtc_addr.ip().to_string(),
@@ -569,7 +578,7 @@ fn handle_session_request(
             &server_user,
             &server_passwd,
             &mid,
-        )))
+        ))
         .expect("could not construct session response");
 
     (incoming_session, response)
