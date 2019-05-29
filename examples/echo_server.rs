@@ -10,20 +10,12 @@ fn main() {
 
     let matches = App::new("echo_server")
         .arg(
-            Arg::with_name("http")
-                .short("h")
-                .long("http")
-                .takes_value(true)
-                .required(true)
-                .help("listen on the specified address/port for incoming HTTP connections"),
-        )
-        .arg(
             Arg::with_name("data")
                 .short("d")
                 .long("data")
                 .takes_value(true)
                 .required(true)
-                .help("listen on the specified address/port for UDP WebRTC data"),
+                .help("listen on the specified address/port for UDP WebRTC data channels"),
         )
         .arg(
             Arg::with_name("public")
@@ -32,31 +24,44 @@ fn main() {
                 .takes_value(true)
                 .help("advertise a different public WebRTC data port than the one listened on"),
         )
+        .arg(
+            Arg::with_name("http")
+                .short("h")
+                .long("http")
+                .takes_value(true)
+                .required(true)
+                .help("listen on the specified address/port for incoming HTTP session requests"),
+        )
         .get_matches();
 
     let mut runtime = Runtime::new().expect("could not build runtime");
 
-    let http_listen_addr = matches
-        .value_of("http")
-        .unwrap()
-        .parse()
-        .expect("could not parse HTTP address/port");
-    let udp_listen_addr = matches
+    let webrtc_listen_addr = matches
         .value_of("data")
         .unwrap()
         .parse()
         .expect("could not parse WebRTC data address/port");
 
-    let public_udp_addr = if let Some(public) = matches.value_of("public") {
+    let public_webrtc_addr = if let Some(public) = matches.value_of("public") {
         public
             .parse()
             .expect("could not parse advertised public WebRTC data address/port")
     } else {
-        udp_listen_addr
+        webrtc_listen_addr
     };
 
-    let mut rtc_server = RtcServer::new(http_listen_addr, udp_listen_addr, public_udp_addr)
-        .expect("could not start RTC server");
+    let session_listen_addr = matches
+        .value_of("http")
+        .unwrap()
+        .parse()
+        .expect("could not parse HTTP address/port");
+
+    let mut rtc_server = RtcServer::new_with_session_server(
+        webrtc_listen_addr,
+        public_webrtc_addr,
+        session_listen_addr,
+    )
+    .expect("could not start RTC server");
     let mut message_buf = vec![0; 0x10000];
     let mut received_message: Option<RtcMessageResult> = None;
 

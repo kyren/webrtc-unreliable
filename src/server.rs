@@ -7,16 +7,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{try_ready, Async, Poll, Stream};
+use futures::{sync::mpsc, try_ready, Async, Future, Poll, Sink, Stream};
+use hyper::{header, service::service_fn, Body, Response, Server};
 use log::{info, warn};
 use openssl::ssl::SslAcceptor;
+use rand::thread_rng;
 use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::buffer_pool::{BufferPool, PooledBuffer};
 use crate::client::{RtcClient, RtcClientError, RtcMessageType, MAX_UDP_PAYLOAD_SIZE};
 use crate::crypto::Crypto;
-use crate::http::{create_http_server, HttpServer, IncomingSessionStream};
+use crate::sdp::{gen_sdp_response, parse_sdp_fields, SdpFields};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
+use crate::util::rand_string;
 
 #[derive(Debug)]
 pub enum RtcError {
@@ -40,7 +43,7 @@ impl fmt::Display for RtcError {
         match self {
             RtcError::ClientNotConnected => write!(f, "client is not connected"),
             RtcError::ClientConnectionNotEstablished => {
-                write!(f, "client WebRTC connection is not established")
+                write!(f, "client connection is not established")
             }
             RtcError::IncompleteMessageRead => {
                 write!(f, "incomplete read of WebRTC Data Channel message")
@@ -58,7 +61,7 @@ impl Error for RtcError {}
 #[derive(Debug)]
 pub enum RtcInternalError {
     IoError(IoError),
-    Other(Box<Error + Sync + Send>),
+    Other(BoxError),
 }
 
 impl fmt::Display for RtcInternalError {
@@ -85,15 +88,29 @@ pub struct RtcMessageResult {
     pub remote_addr: SocketAddr,
 }
 
+pub struct SessionRequest(SdpFields);
+
+impl SessionRequest {
+    fn parse(body: Body) -> impl Future<Item = SessionRequest, Error = BoxError> {
+        parse_sdp_fields(body).map(SessionRequest)
+    }
+}
+
+pub type SessionResponse = Response<Body>;
+
 pub struct RtcServer {
     udp_socket: UdpSocket,
-    http_server: HttpServer,
-    incoming_session_stream: IncomingSessionStream,
+    public_webrtc_addr: SocketAddr,
+    session_server: Option<(
+        Box<Future<Item = (), Error = BoxError> + Send>,
+        Box<Stream<Item = IncomingSession, Error = ()> + Send>,
+    )>,
+    cert_fingerprint: String,
     ssl_acceptor: SslAcceptor,
     outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
     incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>,
     buffer_pool: BufferPool,
-    ice_clients: HashMap<IceClientKey, IceClient>,
+    sdp_clients: HashMap<SdpClientKey, SdpClient>,
     rtc_clients: HashMap<SocketAddr, RtcClient>,
     last_generate_periodic: Instant,
     last_cleanup: Instant,
@@ -101,36 +118,105 @@ pub struct RtcServer {
 }
 
 impl RtcServer {
+    /// Start a new WebRTC data channel server listening on `webrtc_listen_addr` and advertising its
+    /// publicly available address as `public_webrtc_addr`.
+    ///
+    /// WebRTC connections must be started with an external communication channel from a browser via
+    /// `RtcServer::start_session`, after which a WebRTC data channel can be opened.
     pub fn new(
-        http_listen_addr: SocketAddr,
-        udp_listen_addr: SocketAddr,
-        public_udp_addr: SocketAddr,
+        webrtc_listen_addr: SocketAddr,
+        public_webrtc_addr: SocketAddr,
     ) -> Result<RtcServer, RtcInternalError> {
-        const SESSION_BUFFER_SIZE: usize = 8;
-
         let crypto = Crypto::init().expect("RtcServer: Could not initialize OpenSSL primitives");
-        let (http_server, incoming_session_stream) = create_http_server(
-            &http_listen_addr,
-            public_udp_addr,
-            crypto.fingerprint,
-            SESSION_BUFFER_SIZE,
+        let udp_socket = UdpSocket::bind(&webrtc_listen_addr).map_err(RtcInternalError::IoError)?;
+
+        info!(
+            "new WebRTC data channel server listening on {:?}, public addr {:?}",
+            webrtc_listen_addr, public_webrtc_addr
         );
-        let udp_socket = UdpSocket::bind(&udp_listen_addr).map_err(RtcInternalError::IoError)?;
 
         Ok(RtcServer {
             udp_socket,
-            http_server,
-            incoming_session_stream,
+            public_webrtc_addr,
+            session_server: None,
+            cert_fingerprint: crypto.fingerprint,
             ssl_acceptor: crypto.ssl_acceptor,
             outgoing_udp: VecDeque::new(),
             incoming_rtc: VecDeque::new(),
             buffer_pool: BufferPool::new(),
-            ice_clients: HashMap::new(),
+            sdp_clients: HashMap::new(),
             rtc_clients: HashMap::new(),
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
             periodic_timer: Interval::new_interval(PERIODIC_TIMER_INTERVAL),
         })
+    }
+
+    /// Start a new WebRTC data channel server with a built-in HTTP session server listening on
+    /// `session_server_listen_addr`.
+    ///
+    /// This server will listen for session requests on the given address and respond automatically
+    /// respond with session descriptions that can be used to complete a WebRTC data channel
+    /// connection.  With this, it is not necessary to set up your own external communication
+    /// channel with a browser for starting new WebRTC connections, nor is it necessary to manually
+    /// call `RtcServer::start_session`.
+    pub fn new_with_session_server(
+        webrtc_listen_addr: SocketAddr,
+        public_webrtc_addr: SocketAddr,
+        session_server_listen_addr: SocketAddr,
+    ) -> Result<RtcServer, RtcInternalError> {
+        let mut server = Self::new(webrtc_listen_addr, public_webrtc_addr)?;
+
+        const SESSION_BUFFER_SIZE: usize = 8;
+        let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
+
+        let cert_fingerprint = server.cert_fingerprint.clone();
+        let http_server = Server::bind(&session_server_listen_addr)
+            .serve(move || {
+                let cert_fingerprint = cert_fingerprint.clone();
+                let session_sender = session_sender.clone();
+                service_fn(move |req| {
+                    let cert_fingerprint = cert_fingerprint.clone();
+                    let session_sender = session_sender.clone();
+                    SessionRequest::parse(req.into_body()).and_then(move |session_request| {
+                        let (incoming_session, response) = handle_session_request(
+                            public_webrtc_addr,
+                            &cert_fingerprint,
+                            session_request,
+                        );
+                        session_sender
+                            .send(incoming_session)
+                            .map_err(BoxError::from)
+                            .map(move |_| response)
+                    })
+                })
+            })
+            .map_err(BoxError::from);
+
+        info!(
+            "listening for WebRTC session requests on HTTP {:?}",
+            session_server_listen_addr,
+        );
+
+        server.session_server = Some((Box::new(http_server), Box::new(session_receiver)));
+
+        Ok(server)
+    }
+
+    /// Handle an incoming session request as a starting point for a new WebRTC connection.
+    ///
+    /// Once an SDP session request is received from a browser over some external channel, it should
+    /// be provided here.  This method will generate an RTC session description response which can
+    /// be delivered over this external channel back to a browser, after which a WebRTC connection
+    /// can be established.
+    pub fn start_session(&mut self, session_request: SessionRequest) -> SessionResponse {
+        let (incoming_session, response) = handle_session_request(
+            self.public_webrtc_addr,
+            &self.cert_fingerprint,
+            session_request,
+        );
+        start_sdp(&mut self.sdp_clients, incoming_session);
+        response
     }
 
     /// Returns true if the client has a completely established WebRTC data channel connection and
@@ -230,49 +316,36 @@ impl RtcServer {
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
     // packets, receives incoming UDP packets, and responds to STUN packets.
     fn process(&mut self) -> Poll<(), RtcInternalError> {
-        if self
-            .http_server
-            .poll()
-            .map_err(|e| RtcInternalError::Other(e.into()))?
-            .is_ready()
-        {
-            return Err(RtcInternalError::Other(
-                "http server has unexpectedly stopped".into(),
-            ));
-        }
-
-        while let Async::Ready(incoming_session) = self.incoming_session_stream.poll().unwrap() {
-            if let Some(incoming_session) = incoming_session {
-                info!(
-                    "ICE connection initiated with server user: '{}' and remote user: '{}'",
-                    incoming_session.server_user, incoming_session.remote_user
-                );
-
-                self.ice_clients.insert(
-                    IceClientKey {
-                        server_user: incoming_session.server_user,
-                        remote_user: incoming_session.remote_user,
-                    },
-                    IceClient {
-                        server_passwd: incoming_session.server_passwd,
-                        ttl: Instant::now(),
-                    },
-                );
-            } else {
+        if let Some((http_server, incoming_session_stream)) = self.session_server.as_mut() {
+            if http_server
+                .poll()
+                .map_err(|e| RtcInternalError::Other(e.into()))?
+                .is_ready()
+            {
                 return Err(RtcInternalError::Other(
-                    "incoming session channel unexpectedly closed".into(),
+                    "http server has unexpectedly stopped".into(),
                 ));
+            }
+
+            while let Async::Ready(incoming_session) = incoming_session_stream.poll().unwrap() {
+                if let Some(incoming_session) = incoming_session {
+                    start_sdp(&mut self.sdp_clients, incoming_session);
+                } else {
+                    return Err(RtcInternalError::Other(
+                        "incoming session channel unexpectedly closed".into(),
+                    ));
+                }
             }
         }
 
         if self.last_cleanup.elapsed() >= CLEANUP_INTERVAL {
             self.last_cleanup = Instant::now();
-            self.ice_clients.retain(|ice_client_key, ice_client| {
-                if ice_client.ttl.elapsed() < ICE_SESSION_TIMEOUT {
+            self.sdp_clients.retain(|ice_client_key, ice_client| {
+                if ice_client.ttl.elapsed() < RTC_SESSION_TIMEOUT {
                     true
                 } else {
                     info!(
-                        "ICE session timeout for server user '{}' and remote user '{}'",
+                        "session timeout for server user '{}' and remote user '{}'",
                         ice_client_key.server_user, ice_client_key.remote_user
                     );
                     false
@@ -280,11 +353,13 @@ impl RtcServer {
             });
 
             self.rtc_clients.retain(|remote_addr, client| {
-                if !client.is_shutdown() && client.last_activity().elapsed() < RTC_SESSION_TIMEOUT {
+                if !client.is_shutdown()
+                    && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
+                {
                     true
                 } else {
                     if !client.is_shutdown() {
-                        info!("timeout for client {:?}", remote_addr);
+                        info!("connection timeout for client {:?}", remote_addr);
                     }
                     info!("client {:?} removed", remote_addr);
                     false
@@ -363,7 +438,7 @@ impl RtcServer {
         packet_buffer.truncate(len);
 
         if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[0..len]) {
-            if let Some(ice_client) = self.ice_clients.get_mut(&IceClientKey {
+            if let Some(ice_client) = self.sdp_clients.get_mut(&SdpClientKey {
                 server_user: stun_binding_request.server_user,
                 remote_user: stun_binding_request.remote_user,
             }) {
@@ -382,7 +457,7 @@ impl RtcServer {
                 match self.rtc_clients.entry(remote_addr) {
                     HashMapEntry::Vacant(vacant) => {
                         info!(
-                            "beginning client WebRTC data channel connection with {:?}",
+                            "beginning client data channel connection with {:?}",
                             remote_addr,
                         );
 
@@ -438,19 +513,85 @@ impl RtcServer {
     }
 }
 
+const RTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
-const ICE_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
 const PERIODIC_PACKET_INTERVAL: Duration = Duration::from_secs(1);
 const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
 
+type BoxError = Box<Error + Send + Sync>;
+
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
-struct IceClientKey {
+struct SdpClientKey {
     server_user: String,
     remote_user: String,
 }
 
-struct IceClient {
+struct SdpClient {
     server_passwd: String,
     ttl: Instant,
+}
+
+struct IncomingSession {
+    pub server_user: String,
+    pub server_passwd: String,
+    pub remote_user: String,
+}
+
+fn handle_session_request(
+    public_webrtc_addr: SocketAddr,
+    cert_fingerprint: &str,
+    session_request: SessionRequest,
+) -> (IncomingSession, Response<Body>) {
+    const SERVER_USER_LEN: usize = 8;
+    const SERVER_PASSWD_LEN: usize = 24;
+
+    let SdpFields { ice_ufrag, mid, .. } = session_request.0;
+    let mut rng = thread_rng();
+    let server_user = rand_string(&mut rng, SERVER_USER_LEN);
+    let server_passwd = rand_string(&mut rng, SERVER_PASSWD_LEN);
+
+    let incoming_session = IncomingSession {
+        server_user: server_user.clone(),
+        server_passwd: server_passwd.clone(),
+        remote_user: ice_ufrag,
+    };
+
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(Body::from(gen_sdp_response(
+            &mut rng,
+            &cert_fingerprint,
+            &public_webrtc_addr.ip().to_string(),
+            public_webrtc_addr.ip().is_ipv6(),
+            public_webrtc_addr.port(),
+            &server_user,
+            &server_passwd,
+            &mid,
+        )))
+        .expect("could not construct session response");
+
+    (incoming_session, response)
+}
+
+fn start_sdp(
+    sdp_clients: &mut HashMap<SdpClientKey, SdpClient>,
+    incoming_session: IncomingSession,
+) {
+    info!(
+        "session initiated with server user: '{}' and remote user: '{}'",
+        incoming_session.server_user, incoming_session.remote_user
+    );
+
+    sdp_clients.insert(
+        SdpClientKey {
+            server_user: incoming_session.server_user,
+            remote_user: incoming_session.remote_user,
+        },
+        SdpClient {
+            server_passwd: incoming_session.server_passwd,
+            ttl: Instant::now(),
+        },
+    );
 }
