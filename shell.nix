@@ -24,6 +24,5 @@ in
       pkg-config
       openssl
       rust
-      hyp
     ];
   }

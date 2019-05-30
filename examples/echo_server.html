@@ -2,10 +2,9 @@
 <head>
     <title>WebRTC Data Channel Echo Server Example</title>
     <script>
-        let PORT = 9555;
         let NUM_PACKETS = 20;
         let SEND_INTERVAL = 500;
-        let ADDRESS = window.location.protocol + "//" + window.location.hostname + ":" + PORT
+        let ADDRESS = "/rtc_session";
 
         let peer = new RTCPeerConnection({
             iceServers: [{

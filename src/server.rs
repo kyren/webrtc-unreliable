@@ -9,12 +9,7 @@ use std::{
 };
 
 use futures::{sync::mpsc, try_ready, Async, Future, Poll, Sink, Stream};
-use http::Response;
-use hyper::{
-    header::{self, HeaderValue},
-    service::service_fn,
-    Body, Server,
-};
+use http::{header, Response};
 use log::{info, warn};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
@@ -108,6 +103,10 @@ impl RtcSessionEndpoint {
     /// browser.
     ///
     /// Parsing of the SDP descriptor is guaranteed to happen in finite memory.
+    ///
+    /// The returned JSON object contains a digest of the x509 certificate the server will use for
+    /// DTLS, and the browser will ensure that this digest matches before starting a WebRTC
+    /// connection.
     pub fn session_request<I, E, S>(
         &self,
         sdp_descriptor: S,
@@ -157,7 +156,7 @@ impl RtcSessionEndpoint {
     pub fn http_session_request<I, E, S>(
         &self,
         sdp_descriptor: S,
-    ) -> impl Future<Item = Response<Body>, Error = BoxError>
+    ) -> impl Future<Item = Response<String>, Error = BoxError>
     where
         I: AsRef<[u8]>,
         S: Stream<Item = I, Error = E>,
@@ -166,7 +165,7 @@ impl RtcSessionEndpoint {
         self.session_request(sdp_descriptor).map(|r| {
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r))
+                .body(r)
                 .expect("could not construct session response")
         })
     }
@@ -174,7 +173,7 @@ impl RtcSessionEndpoint {
 
 pub struct RtcServer {
     udp_socket: UdpSocket,
-    internal_session_server: Option<Box<Future<Item = (), Error = BoxError> + Send>>,
+    session_endpoint: RtcSessionEndpoint,
     incoming_session_stream: Box<Stream<Item = IncomingSession, Error = ()> + Send>,
     ssl_acceptor: SslAcceptor,
     outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
@@ -189,16 +188,15 @@ pub struct RtcServer {
 
 impl RtcServer {
     /// Start a new WebRTC data channel server listening on `webrtc_listen_addr` and advertising its
-    /// publicly available address as `public_webrtc_addr`, with externally handled session
-    /// initiation.
+    /// publicly available address as `public_webrtc_addr`.
     ///
     /// Returns both an `RtcServer` and a `RtcSessionEndpoint`.  WebRTC connections must be started
     /// via an external communication channel from a browser via the `RtcSessionEndpoint`, after
     /// which a WebRTC data channel can be opened.
-    pub fn new_with_external_session_server(
+    pub fn new(
         webrtc_listen_addr: SocketAddr,
         public_webrtc_addr: SocketAddr,
-    ) -> Result<(RtcServer, RtcSessionEndpoint), RtcInternalError> {
+    ) -> Result<RtcServer, RtcInternalError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 
         let crypto = Crypto::init().expect("RtcServer: Could not initialize OpenSSL primitives");
@@ -211,9 +209,15 @@ impl RtcServer {
             webrtc_listen_addr, public_webrtc_addr
         );
 
-        let rtc_server = RtcServer {
+        let session_endpoint = RtcSessionEndpoint {
+            public_webrtc_addr,
+            cert_fingerprint: Arc::new(crypto.fingerprint),
+            session_sender,
+        };
+
+        Ok(RtcServer {
             udp_socket,
-            internal_session_server: None,
+            session_endpoint,
             incoming_session_stream: Box::new(session_receiver),
             ssl_acceptor: crypto.ssl_acceptor,
             outgoing_udp: VecDeque::new(),
@@ -224,56 +228,20 @@ impl RtcServer {
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
             periodic_timer: Interval::new_interval(PERIODIC_TIMER_INTERVAL),
-        };
-
-        let rtc_session_endpoint = RtcSessionEndpoint {
-            public_webrtc_addr,
-            cert_fingerprint: Arc::new(crypto.fingerprint),
-            session_sender,
-        };
-
-        Ok((rtc_server, rtc_session_endpoint))
+        })
     }
 
-    /// Start a new WebRTC data channel server with a built-in HTTP session server listening on
-    /// `session_server_listen_addr`.
+    /// Returns a `SessionEndpoint` which can be used to start new WebRTC sessions.
     ///
-    /// This server will listen for session requests over HTTP on the given address and
-    /// automatically respond with session descriptions that can be used to complete a WebRTC data
-    /// channel connection.
-    pub fn new_with_internal_session_server(
-        webrtc_listen_addr: SocketAddr,
-        public_webrtc_addr: SocketAddr,
-        session_server_listen_addr: SocketAddr,
-    ) -> Result<RtcServer, RtcInternalError> {
-        let (mut server, session_endpoint) =
-            Self::new_with_external_session_server(webrtc_listen_addr, public_webrtc_addr)?;
-
-        let internal_session_server = Server::bind(&session_server_listen_addr)
-            .serve(move || {
-                let session_endpoint = session_endpoint.clone();
-                service_fn(move |req| {
-                    session_endpoint
-                        .http_session_request(req.into_body())
-                        .map(|mut resp| {
-                            resp.headers_mut().insert(
-                                header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                                HeaderValue::from_static("*"),
-                            );
-                            resp
-                        })
-                })
-            })
-            .map_err(BoxError::from);
-
-        info!(
-            "listening for WebRTC session requests on HTTP {:?}",
-            session_server_listen_addr,
-        );
-
-        server.internal_session_server = Some(Box::new(internal_session_server));
-
-        Ok(server)
+    /// WebRTC connections must be started via an external communication channel from a browser via
+    /// the returned `RtcSessionEndpoint`, and this communication channel will be used to exchange
+    /// session descriptions in SDP format.
+    ///
+    /// The returned `RtcSessionEndpoint` will notify this `RtcServer` of new sessions via a shared
+    /// async channel.  This is done so that the `RtcSessionEndpoint` is easy to use in a separate
+    /// server task (such as a `hyper` HTTP server).
+    pub fn session_endpoint(&self) -> RtcSessionEndpoint {
+        self.session_endpoint.clone()
     }
 
     /// Returns true if the client has a completely established WebRTC data channel connection and
@@ -373,18 +341,6 @@ impl RtcServer {
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
     // packets, receives incoming UDP packets, and responds to STUN packets.
     fn process(&mut self) -> Poll<(), RtcInternalError> {
-        if let Some(session_server) = self.internal_session_server.as_mut() {
-            if session_server
-                .poll()
-                .map_err(|e| RtcInternalError::Other(e.into()))?
-                .is_ready()
-            {
-                return Err(RtcInternalError::Other(
-                    "internal http session server has unexpectedly stopped".into(),
-                ));
-            }
-        }
-
         loop {
             match self.incoming_session_stream.poll() {
                 Ok(Async::Ready(Some(incoming_session))) => {
@@ -404,9 +360,13 @@ impl RtcServer {
                         },
                     );
                 }
-                // Dropping the RtcSessionEndpoint is allowed, but no new connections can be
-                // started.
-                _ => break,
+                Ok(Async::NotReady) => break,
+                Ok(Async::Ready(None)) => {
+                    return Err(RtcInternalError::Other(
+                        "connection to RtcSessionEndpoint has unexpectedly closed".into(),
+                    ));
+                }
+                Err(_) => unreachable!(),
             }
         }
 
