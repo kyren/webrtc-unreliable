@@ -23,6 +23,8 @@ impl Crypto {
         const X509_DAYS_NOT_BEFORE: u32 = 0;
         const X509_DAYS_NOT_AFTER: u32 = 365;
 
+        // TODO: Let the user pick the public key algorithm and x509 digest algorithm.
+
         let rsa = Rsa::generate(2048)?;
         let key = PKey::from_rsa(rsa)?;
 
