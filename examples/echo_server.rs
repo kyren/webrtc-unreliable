@@ -56,7 +56,7 @@ fn main() {
         .parse()
         .expect("could not parse HTTP address/port");
 
-    let mut rtc_server = RtcServer::new_with_session_server(
+    let mut rtc_server = RtcServer::new_with_internal_session_server(
         webrtc_listen_addr,
         public_webrtc_addr,
         session_listen_addr,
