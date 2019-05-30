@@ -1,3 +1,5 @@
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use clap::{App, Arg};
 use futures::{
     future::{self, Either, IntoFuture},
@@ -43,9 +45,9 @@ fn main() {
         )
         .get_matches();
 
-    let mut runtime = Runtime::new().expect("could not build runtime");
+    let mut runtime = Runtime::new().expect("could not build tokio runtime");
 
-    let webrtc_listen_addr = matches
+    let webrtc_listen_addr: SocketAddr = matches
         .value_of("data")
         .unwrap()
         .parse()
@@ -56,7 +58,15 @@ fn main() {
             .parse()
             .expect("could not parse advertised public WebRTC data address/port")
     } else {
-        webrtc_listen_addr
+        if webrtc_listen_addr.ip().is_unspecified() {
+            if webrtc_listen_addr.is_ipv4() {
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), webrtc_listen_addr.port())
+            } else {
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), webrtc_listen_addr.port())
+            }
+        } else {
+            webrtc_listen_addr
+        }
     };
 
     let session_listen_addr = matches
