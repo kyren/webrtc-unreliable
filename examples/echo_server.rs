@@ -1,5 +1,3 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-
 use clap::{App, Arg};
 use futures::{
     future::{self, Either, IntoFuture},
@@ -9,7 +7,7 @@ use hyper::{
     header::{self, HeaderValue},
     server::conn::AddrStream,
     service::{make_service_fn, service_fn},
-    Body, Response, Server, StatusCode,
+    Body, Method, Response, Server, StatusCode,
 };
 use log::{info, warn};
 use tokio::runtime::Runtime;
@@ -33,7 +31,8 @@ fn main() {
                 .short("p")
                 .long("public")
                 .takes_value(true)
-                .help("advertise a different public WebRTC data port than the one listened on"),
+                .required(true)
+                .help("advertise the given address/port as the public WebRTC address/port"),
         )
         .arg(
             Arg::with_name("http")
@@ -47,27 +46,17 @@ fn main() {
 
     let mut runtime = Runtime::new().expect("could not build tokio runtime");
 
-    let webrtc_listen_addr: SocketAddr = matches
+    let webrtc_listen_addr = matches
         .value_of("data")
         .unwrap()
         .parse()
         .expect("could not parse WebRTC data address/port");
 
-    let public_webrtc_addr = if let Some(public) = matches.value_of("public") {
-        public
-            .parse()
-            .expect("could not parse advertised public WebRTC data address/port")
-    } else {
-        if webrtc_listen_addr.ip().is_unspecified() {
-            if webrtc_listen_addr.is_ipv4() {
-                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), webrtc_listen_addr.port())
-            } else {
-                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), webrtc_listen_addr.port())
-            }
-        } else {
-            webrtc_listen_addr
-        }
-    };
+    let public_webrtc_addr = matches
+        .value_of("public")
+        .unwrap()
+        .parse()
+        .expect("could not parse advertised public WebRTC data address/port");
 
     let session_listen_addr = matches
         .value_of("http")
@@ -87,14 +76,17 @@ fn main() {
                 let session_endpoint = session_endpoint.clone();
                 let remote_addr = addr_stream.remote_addr();
                 service_fn(move |req| {
-                    if req.uri().path() == "/" || req.uri().path() == "/index.html" {
+                    if req.uri().path() == "/"
+                        || req.uri().path() == "/index.html" && req.method() == Method::GET
+                    {
                         info!("serving example index HTML to {:?}", remote_addr);
                         Either::A(
                             Response::builder()
                                 .body(Body::from(include_str!("./echo_server.html")))
                                 .into_future(),
                         )
-                    } else if req.uri().path() == "/rtc_session" {
+                    } else if req.uri().path() == "/new_rtc_session" && req.method() == Method::POST
+                    {
                         info!("WebRTC session request from {:?}", remote_addr);
                         Either::B(
                             session_endpoint
