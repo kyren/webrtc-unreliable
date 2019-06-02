@@ -30,9 +30,9 @@ use crate::sctp::{
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 // TODO: I'm not sure whether this is correct
-pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
-pub const MAX_DTLS_MESSAGE_SIZE: usize = 16384;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 65507;
+pub const MAX_DTLS_MESSAGE_SIZE: usize = 16384;
+pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
 
 #[derive(Debug)]
 pub enum RtcClientError {

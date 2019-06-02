@@ -545,9 +545,9 @@ impl RtcServer {
     }
 }
 
-const RTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
+const RTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const PERIODIC_PACKET_INTERVAL: Duration = Duration::from_secs(1);
 const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
 
