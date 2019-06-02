@@ -258,7 +258,7 @@ pub fn read_sctp_packet<'a>(
                 let new_cumulative_tsn = NetworkEndian::read_u32(&chunk_data[0..4]);
                 *chunk = SctpChunk::ForwardTsn { new_cumulative_tsn };
             }
-            _ => unimplemented!(),
+            _ => return Err(SctpReadError::BadPacket),
         }
 
         remaining_chunks = &remaining_chunks[chunk_next..];

@@ -266,7 +266,7 @@ impl RtcClient {
                             self.receive_sctp_packet(&sctp_packet)?;
                         }
                         Err(err) => {
-                            warn!("sctp read error on packet received over DTLS: {:?}", err);
+                            warn!("sctp read error on packet received over DTLS: {}", err);
                         }
                     }
                 }
@@ -600,14 +600,21 @@ enum SctpState {
 }
 
 fn ssl_err_to_client_err(err: SslError) -> RtcClientError {
-    match err.into_io_error() {
-        Ok(err) => *err
-            .into_inner()
-            .expect("io error does not have inner error")
-            .downcast()
-            .expect("inner io error was not RtcClientError"),
-        Err(err) => RtcClientError::TlsError(err),
+    if let Some(io_err) = err.io_error() {
+        if let Some(inner) = io_err.get_ref() {
+            if inner.is::<RtcClientError>() {
+                return *err
+                    .into_io_error()
+                    .unwrap()
+                    .into_inner()
+                    .unwrap()
+                    .downcast()
+                    .unwrap();
+            }
+        }
     }
+
+    RtcClientError::TlsError(err)
 }
 
 fn max_tsn(a: u32, b: u32) -> u32 {
