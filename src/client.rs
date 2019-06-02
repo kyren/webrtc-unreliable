@@ -195,7 +195,7 @@ impl RtcClient {
                                 dest_port: self.sctp_remote_port,
                                 verification_tag: self.sctp_remote_verification_tag,
                                 chunks: &[SctpChunk::Heartbeat {
-                                    heartbeat_info: None,
+                                    heartbeat_info: Some(SCTP_HEARTBEAT),
                                 }],
                             },
                         )?;
@@ -583,6 +583,7 @@ impl Write for ClientSslPackets {
 }
 
 const SCTP_COOKIE: &[u8] = b"WEBRTC-UNRELIABLE-COOKIE";
+const SCTP_HEARTBEAT: &[u8] = b"WEBRTC-UNRELIABLE-HEARTBEAT";
 const SCTP_MAX_CHUNKS: usize = 16;
 const SCTP_BUFFER_SIZE: u32 = 0x40000;
 

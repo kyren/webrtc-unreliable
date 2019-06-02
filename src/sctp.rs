@@ -461,7 +461,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                             .try_into()
                             .map_err(|_| SctpWriteError::OutOfRange)?,
                     );
-                    chunk_data[4..].copy_from_slice(heartbeat_info);
+                    chunk_data[4..4 + heartbeat_info.len()].copy_from_slice(heartbeat_info);
                     data_len
                 } else {
                     0
@@ -483,7 +483,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 if chunk_data.len() < state_cookie.len() {
                     return Err(SctpWriteError::BufferSize);
                 }
-                chunk_data.copy_from_slice(state_cookie);
+                chunk_data[0..state_cookie.len()].copy_from_slice(state_cookie);
                 (CHUNK_TYPE_COOKIE_ECHO, 0, state_cookie.len())
             }
             SctpChunk::CookieAck => (CHUNK_TYPE_COOKIE_ACK, 0, 0),

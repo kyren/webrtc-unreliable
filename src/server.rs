@@ -314,8 +314,8 @@ impl RtcServer {
     /// Receive a WebRTC data channel message from any connected client.
     ///
     /// `poll_recv` *must* be called until it returns Async::NotReady for proper operation of the
-    /// server, as it also handles background tasks such as responding to STUN packets, timing out
-    /// existing sessions, and handling HTTP requests.
+    /// server, as it also handles background tasks such as responding to STUN packets and timing
+    /// out existing sessions.
     pub fn poll_recv(&mut self, buf: &mut [u8]) -> Poll<RtcMessageResult, RtcError> {
         while self.incoming_rtc.is_empty() {
             try_ready!(self.process());
