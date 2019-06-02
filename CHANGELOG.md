@@ -1,3 +1,6 @@
+## [0.2.1]
+- Small doc fixes
+
 ## [0.2.0]
 - Remove internal hyper server, API now requires external channel for session
   initiation (more flexible, only a small amount of server code required to
