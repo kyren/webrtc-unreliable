@@ -29,7 +29,7 @@ impl Crypto {
         let key = PKey::from_rsa(rsa)?;
 
         let mut name_builder = X509NameBuilder::new()?;
-        name_builder.append_entry_by_nid(Nid::COMMONNAME, "rtcdata")?;
+        name_builder.append_entry_by_nid(Nid::COMMONNAME, "webrtc-unreliable")?;
         let name = name_builder.build();
 
         let mut x509_builder = X509::builder()?;
@@ -41,7 +41,7 @@ impl Crypto {
         x509_builder.set_not_before(&not_before)?;
         x509_builder.set_not_after(&not_after)?;
         x509_builder.set_pubkey(&key)?;
-        x509_builder.sign(&key, MessageDigest::sha1())?;
+        x509_builder.sign(&key, MessageDigest::sha256())?;
         let x509 = x509_builder.build();
 
         let x509_digest = x509.digest(MessageDigest::sha256())?;
