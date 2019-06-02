@@ -120,7 +120,7 @@ impl RtcSessionEndpoint {
         parse_sdp_fields(sdp_descriptor)
             .map_err(BoxError::from)
             .and_then(move |SdpFields { ice_ufrag, mid, .. }| {
-                const SERVER_USER_LEN: usize = 8;
+                const SERVER_USER_LEN: usize = 12;
                 const SERVER_PASSWD_LEN: usize = 24;
 
                 let mut rng = thread_rng();
@@ -179,7 +179,7 @@ pub struct RtcServer {
     outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
     incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>,
     buffer_pool: BufferPool,
-    sdp_clients: HashMap<SdpClientKey, SdpClient>,
+    ice_clients: HashMap<IceClientKey, IceClient>,
     rtc_clients: HashMap<SocketAddr, RtcClient>,
     last_generate_periodic: Instant,
     last_cleanup: Instant,
@@ -223,7 +223,7 @@ impl RtcServer {
             outgoing_udp: VecDeque::new(),
             incoming_rtc: VecDeque::new(),
             buffer_pool: BufferPool::new(),
-            sdp_clients: HashMap::new(),
+            ice_clients: HashMap::new(),
             rtc_clients: HashMap::new(),
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
@@ -349,12 +349,12 @@ impl RtcServer {
                         incoming_session.server_user, incoming_session.remote_user
                     );
 
-                    self.sdp_clients.insert(
-                        SdpClientKey {
+                    self.ice_clients.insert(
+                        IceClientKey {
                             server_user: incoming_session.server_user,
                             remote_user: incoming_session.remote_user,
                         },
-                        SdpClient {
+                        IceClient {
                             server_passwd: incoming_session.server_passwd,
                             ttl: Instant::now(),
                         },
@@ -372,8 +372,8 @@ impl RtcServer {
 
         if self.last_cleanup.elapsed() >= CLEANUP_INTERVAL {
             self.last_cleanup = Instant::now();
-            self.sdp_clients.retain(|ice_client_key, ice_client| {
-                if ice_client.ttl.elapsed() < RTC_SESSION_TIMEOUT {
+            self.ice_clients.retain(|ice_client_key, ice_client| {
+                if ice_client.ttl.elapsed() < RTC_ICE_TIMEOUT {
                     true
                 } else {
                     info!(
@@ -470,7 +470,7 @@ impl RtcServer {
         packet_buffer.truncate(len);
 
         if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[0..len]) {
-            if let Some(ice_client) = self.sdp_clients.get_mut(&SdpClientKey {
+            if let Some(ice_client) = self.ice_clients.get_mut(&IceClientKey {
                 server_user: stun_binding_request.server_user,
                 remote_user: stun_binding_request.remote_user,
             }) {
@@ -546,7 +546,7 @@ impl RtcServer {
 }
 
 const RTC_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const RTC_ICE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const PERIODIC_PACKET_INTERVAL: Duration = Duration::from_secs(1);
 const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
@@ -554,12 +554,12 @@ const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
 type BoxError = Box<Error + Send + Sync>;
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
-struct SdpClientKey {
+struct IceClientKey {
     server_user: String,
     remote_user: String,
 }
 
-struct SdpClient {
+struct IceClient {
     server_passwd: String,
     ttl: Instant,
 }
