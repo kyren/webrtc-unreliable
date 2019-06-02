@@ -102,8 +102,6 @@ impl RtcSessionEndpoint {
     /// objects which can construct an `RTCSessionDescription` and an `RTCIceCandidate` in a
     /// browser.
     ///
-    /// Parsing of the SDP descriptor is guaranteed to happen in finite memory.
-    ///
     /// The returned JSON object contains a digest of the x509 certificate the server will use for
     /// DTLS, and the browser will ensure that this digest matches before starting a WebRTC
     /// connection.
@@ -190,9 +188,8 @@ impl RtcServer {
     /// Start a new WebRTC data channel server listening on `webrtc_listen_addr` and advertising its
     /// publicly available address as `public_webrtc_addr`.
     ///
-    /// Returns both an `RtcServer` and a `RtcSessionEndpoint`.  WebRTC connections must be started
-    /// via an external communication channel from a browser via the `RtcSessionEndpoint`, after
-    /// which a WebRTC data channel can be opened.
+    /// WebRTC connections must be started via an external communication channel from a browser via
+    /// the `RtcSessionEndpoint`, after which a WebRTC data channel can be opened.
     pub fn new(
         webrtc_listen_addr: SocketAddr,
         public_webrtc_addr: SocketAddr,
