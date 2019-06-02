@@ -52,13 +52,22 @@ pub enum SctpChunk<'a> {
         cumulative_tsn_ack: u32,
     },
     ShutdownAck,
+    Error,
     CookieEcho {
         state_cookie: &'a [u8],
     },
     CookieAck,
+    ShutdownComplete,
+    Auth,
+    AsConfAck,
+    ReConfig,
+    Pad,
+    IData,
     ForwardTsn {
         new_cumulative_tsn: u32,
     },
+    AsConf,
+    IForwardTsn,
 }
 
 #[derive(Debug)]
@@ -242,6 +251,9 @@ pub fn read_sctp_packet<'a>(
             CHUNK_TYPE_SHUTDOWN_ACK => {
                 *chunk = SctpChunk::ShutdownAck;
             }
+            CHUNK_TYPE_ERROR => {
+                *chunk = SctpChunk::Error;
+            }
             CHUNK_TYPE_COOKIE_ECHO => {
                 *chunk = SctpChunk::CookieEcho {
                     state_cookie: chunk_data,
@@ -250,6 +262,24 @@ pub fn read_sctp_packet<'a>(
             CHUNK_TYPE_COOKIE_ACK => {
                 *chunk = SctpChunk::CookieAck;
             }
+            CHUNK_TYPE_SHUTDOWN_COMPLETE => {
+                *chunk = SctpChunk::ShutdownComplete;
+            }
+            CHUNK_TYPE_AUTH => {
+                *chunk = SctpChunk::Auth;
+            }
+            CHUNK_TYPE_ASCONF_ACK => {
+                *chunk = SctpChunk::AsConfAck;
+            }
+            CHUNK_TYPE_RE_CONFIG => {
+                *chunk = SctpChunk::ReConfig;
+            }
+            CHUNK_TYPE_PAD => {
+                *chunk = SctpChunk::Pad;
+            }
+            CHUNK_TYPE_IDATA => {
+                *chunk = SctpChunk::IData;
+            }
             CHUNK_TYPE_FORWARD_TSN => {
                 if chunk_data.len() < 4 {
                     return Err(SctpReadError::BadPacket);
@@ -257,6 +287,12 @@ pub fn read_sctp_packet<'a>(
 
                 let new_cumulative_tsn = NetworkEndian::read_u32(&chunk_data[0..4]);
                 *chunk = SctpChunk::ForwardTsn { new_cumulative_tsn };
+            }
+            CHUNK_TYPE_ASCONF => {
+                *chunk = SctpChunk::AsConf;
+            }
+            CHUNK_TYPE_I_FORWARD_TSN => {
+                *chunk = SctpChunk::IForwardTsn;
             }
             _ => return Err(SctpReadError::BadPacket),
         }
@@ -451,6 +487,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 (CHUNK_TYPE_COOKIE_ECHO, 0, state_cookie.len())
             }
             SctpChunk::CookieAck => (CHUNK_TYPE_COOKIE_ACK, 0, 0),
+            SctpChunk::ShutdownComplete => (CHUNK_TYPE_SHUTDOWN_COMPLETE, 0, 0),
             SctpChunk::ForwardTsn { new_cumulative_tsn } => {
                 let data_len = 4;
                 if chunk_data.len() < 4 {
@@ -459,6 +496,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 NetworkEndian::write_u32(&mut chunk_data[0..4], new_cumulative_tsn);
                 (CHUNK_TYPE_FORWARD_TSN, 0, data_len)
             }
+            chunk => unimplemented!("write for SCTP chunk {:?} not implemented", chunk),
         };
 
         let data_padded_len = next_multiple(data_len, 4);
@@ -497,9 +535,18 @@ const CHUNK_TYPE_HEARTBEAT_ACK: u8 = 0x05;
 const CHUNK_TYPE_ABORT: u8 = 0x06;
 const CHUNK_TYPE_SHUTDOWN: u8 = 0x07;
 const CHUNK_TYPE_SHUTDOWN_ACK: u8 = 0x08;
+const CHUNK_TYPE_ERROR: u8 = 0x09;
 const CHUNK_TYPE_COOKIE_ECHO: u8 = 0x0a;
 const CHUNK_TYPE_COOKIE_ACK: u8 = 0x0b;
+const CHUNK_TYPE_SHUTDOWN_COMPLETE: u8 = 0x0e;
+const CHUNK_TYPE_AUTH: u8 = 0x0f;
+const CHUNK_TYPE_ASCONF_ACK: u8 = 0x80;
+const CHUNK_TYPE_RE_CONFIG: u8 = 0x82;
+const CHUNK_TYPE_PAD: u8 = 0x84;
+const CHUNK_TYPE_IDATA: u8 = 0x40;
 const CHUNK_TYPE_FORWARD_TSN: u8 = 0xc0;
+const CHUNK_TYPE_ASCONF: u8 = 0xc1;
+const CHUNK_TYPE_I_FORWARD_TSN: u8 = 0xc2;
 
 const INIT_ACK_PARAM_STATE_COOKIE: u16 = 0x07;
 const HEARTBEAT_PARAM_INFO: u16 = 0x07;

@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use openssl::{
     error::ErrorStack as OpenSslErrorStack,
     ssl::{
@@ -266,7 +266,7 @@ impl RtcClient {
                             self.receive_sctp_packet(&sctp_packet)?;
                         }
                         Err(err) => {
-                            warn!("sctp read error on packet received over DTLS: {}", err);
+                            debug!("sctp read error on packet received over DTLS: {}", err);
                         }
                     }
                 }
@@ -531,6 +531,7 @@ impl RtcClient {
                     self.sctp_remote_tsn = new_cumulative_tsn;
                 }
                 SctpChunk::InitAck { .. } | SctpChunk::CookieAck => {}
+                chunk => debug!("unhandled SCTP chunk {:?}", chunk),
             }
         }
 
