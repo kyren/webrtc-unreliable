@@ -84,6 +84,7 @@ impl From<InternalError> for RecvError {
     }
 }
 
+/// Generally fatal internal error in the WebRTC server.
 #[derive(Debug)]
 pub enum InternalError {
     IoError(IoError),
