@@ -7,5 +7,5 @@ mod server;
 mod stun;
 mod util;
 
-pub use client::RtcMessageType;
-pub use server::{RtcError, RtcMessageResult, RtcServer, RtcSessionEndpoint};
+pub use client::MessageType;
+pub use server::{MessageResult, RecvError, SendError, Server, SessionEndpoint};

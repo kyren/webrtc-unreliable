@@ -16,89 +16,108 @@ use rand::thread_rng;
 use tokio::{net::UdpSocket, timer::Interval};
 
 use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::client::{RtcClient, RtcClientError, RtcMessageType, MAX_UDP_PAYLOAD_SIZE};
+use crate::client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE};
 use crate::crypto::Crypto;
 use crate::sdp::{gen_sdp_response, parse_sdp_fields, SdpFields};
 use crate::stun::{parse_stun_binding_request, write_stun_success_response};
 use crate::util::rand_string;
 
 #[derive(Debug)]
-pub enum RtcError {
+pub enum SendError {
     /// Non-fatal error trying to send a message to a disconnected client.
     ClientNotConnected,
     /// Non-fatal error trying to send a message to a client whose WebRTC connection has not been
     /// established yet or is currently shutting down.
     ClientConnectionNotEstablished,
-    /// Non-fatal error reading a WebRTC Data Channel message that is too large to fit in the
-    /// provided buffer.
-    IncompleteMessageRead,
     /// Non-fatal error writing a WebRTC Data Channel message that is too large to fit in the
     /// maximum message size.
     IncompleteMessageWrite,
     /// Other generally fatal internal errors.
-    Internal(RtcInternalError),
+    Internal(InternalError),
 }
 
-impl fmt::Display for RtcError {
+impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            RtcError::ClientNotConnected => write!(f, "client is not connected"),
-            RtcError::ClientConnectionNotEstablished => {
+            SendError::ClientNotConnected => write!(f, "client is not connected"),
+            SendError::ClientConnectionNotEstablished => {
                 write!(f, "client connection is not established")
             }
-            RtcError::IncompleteMessageRead => {
-                write!(f, "incomplete read of WebRTC Data Channel message")
-            }
-            RtcError::IncompleteMessageWrite => {
+            SendError::IncompleteMessageWrite => {
                 write!(f, "incomplete write of WebRTC Data Channel message")
             }
-            RtcError::Internal(err) => fmt::Display::fmt(err, f),
+            SendError::Internal(err) => fmt::Display::fmt(err, f),
         }
     }
 }
 
-impl Error for RtcError {}
+impl From<InternalError> for SendError {
+    fn from(err: InternalError) -> SendError {
+        SendError::Internal(err)
+    }
+}
 
 #[derive(Debug)]
-pub enum RtcInternalError {
+pub enum RecvError {
+    /// Non-fatal error reading a WebRTC Data Channel message that is too large to fit in the
+    /// provided buffer.
+    IncompleteMessageRead,
+    /// Other generally fatal internal errors.
+    Internal(InternalError),
+}
+impl Error for RecvError {}
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            RecvError::IncompleteMessageRead => {
+                write!(f, "incomplete read of WebRTC Data Channel message")
+            }
+            RecvError::Internal(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl From<InternalError> for RecvError {
+    fn from(err: InternalError) -> RecvError {
+        RecvError::Internal(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum InternalError {
     IoError(IoError),
     Other(BoxError),
 }
 
-impl fmt::Display for RtcInternalError {
+impl fmt::Display for InternalError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            RtcInternalError::IoError(err) => fmt::Display::fmt(err, f),
-            RtcInternalError::Other(err) => fmt::Display::fmt(err, f),
+            InternalError::IoError(err) => fmt::Display::fmt(err, f),
+            InternalError::Other(err) => fmt::Display::fmt(err, f),
         }
     }
 }
 
-impl Error for RtcInternalError {}
-
-impl From<RtcInternalError> for RtcError {
-    fn from(err: RtcInternalError) -> RtcError {
-        RtcError::Internal(err)
-    }
-}
+impl Error for InternalError {}
 
 #[derive(Copy, Clone, Debug)]
-pub struct RtcMessageResult {
+pub struct MessageResult {
     pub message_len: usize,
-    pub message_type: RtcMessageType,
+    pub message_type: MessageType,
     pub remote_addr: SocketAddr,
 }
 
 #[derive(Clone)]
-pub struct RtcSessionEndpoint {
-    public_webrtc_addr: SocketAddr,
+pub struct SessionEndpoint {
+    public_addr: SocketAddr,
     cert_fingerprint: Arc<String>,
     session_sender: mpsc::Sender<IncomingSession>,
 }
 
-impl RtcSessionEndpoint {
+impl SessionEndpoint {
     /// Receives an incoming SDP descriptor of an `RTCSessionDescription` from a browser, informs
-    /// the corresponding `RtcServer` of the new RTC session, and returns a JSON object containing
+    /// the corresponding `Server` of the new WebRTC session, and returns a JSON object containing
     /// objects which can construct an `RTCSessionDescription` and an `RTCIceCandidate` in a
     /// browser.
     ///
@@ -134,9 +153,9 @@ impl RtcSessionEndpoint {
                 let response = gen_sdp_response(
                     &mut rng,
                     &this.cert_fingerprint,
-                    &this.public_webrtc_addr.ip().to_string(),
-                    this.public_webrtc_addr.ip().is_ipv6(),
-                    this.public_webrtc_addr.port(),
+                    &this.public_addr.ip().to_string(),
+                    this.public_addr.ip().is_ipv6(),
+                    this.public_addr.port(),
                     &server_user,
                     &server_passwd,
                     &mid,
@@ -169,50 +188,47 @@ impl RtcSessionEndpoint {
     }
 }
 
-pub struct RtcServer {
+pub struct Server {
     udp_socket: UdpSocket,
-    session_endpoint: RtcSessionEndpoint,
+    session_endpoint: SessionEndpoint,
     incoming_session_stream: Box<Stream<Item = IncomingSession, Error = ()> + Send>,
     ssl_acceptor: SslAcceptor,
     outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
-    incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, RtcMessageType)>,
+    incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, MessageType)>,
     buffer_pool: BufferPool,
     sessions: HashMap<SessionKey, Session>,
-    clients: HashMap<SocketAddr, RtcClient>,
+    clients: HashMap<SocketAddr, Client>,
     last_generate_periodic: Instant,
     last_cleanup: Instant,
     periodic_timer: Interval,
 }
 
-impl RtcServer {
-    /// Start a new WebRTC data channel server listening on `webrtc_listen_addr` and advertising its
-    /// publicly available address as `public_webrtc_addr`.
+impl Server {
+    /// Start a new WebRTC data channel server listening on `listen_addr` and advertising its
+    /// publicly available address as `public_addr`.
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
-    /// the `RtcSessionEndpoint`, after which a WebRTC data channel can be opened.
-    pub fn new(
-        webrtc_listen_addr: SocketAddr,
-        public_webrtc_addr: SocketAddr,
-    ) -> Result<RtcServer, RtcInternalError> {
+    /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
+    pub fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, InternalError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 
-        let crypto = Crypto::init().expect("RtcServer: Could not initialize OpenSSL primitives");
-        let udp_socket = UdpSocket::bind(&webrtc_listen_addr).map_err(RtcInternalError::IoError)?;
+        let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
+        let udp_socket = UdpSocket::bind(&listen_addr).map_err(InternalError::IoError)?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
 
         info!(
-            "new WebRTC data channel server listening on {:?}, public addr {:?}",
-            webrtc_listen_addr, public_webrtc_addr
+            "new WebRTC data channel server listening on {}, public addr {}",
+            listen_addr, public_addr
         );
 
-        let session_endpoint = RtcSessionEndpoint {
-            public_webrtc_addr,
+        let session_endpoint = SessionEndpoint {
+            public_addr,
             cert_fingerprint: Arc::new(crypto.fingerprint),
             session_sender,
         };
 
-        Ok(RtcServer {
+        Ok(Server {
             udp_socket,
             session_endpoint,
             incoming_session_stream: Box::new(session_receiver),
@@ -237,7 +253,7 @@ impl RtcServer {
     /// The returned `RtcSessionEndpoint` will notify this `RtcServer` of new sessions via a shared
     /// async channel.  This is done so that the `RtcSessionEndpoint` is easy to use in a separate
     /// server task (such as a `hyper` HTTP server).
-    pub fn session_endpoint(&self) -> RtcSessionEndpoint {
+    pub fn session_endpoint(&self) -> SessionEndpoint {
         self.session_endpoint.clone()
     }
 
@@ -257,11 +273,11 @@ impl RtcServer {
         if let Some(client) = self.clients.get_mut(remote_addr) {
             if let Err(err) = client.start_shutdown() {
                 warn!(
-                    "error starting shutdown for client {:?}: {}",
+                    "error starting shutdown for client {}: {}",
                     remote_addr, err
                 );
             } else {
-                info!("starting shutdown for client {:?}", remote_addr);
+                info!("starting shutdown for client {}", remote_addr);
             }
         }
     }
@@ -270,34 +286,34 @@ impl RtcServer {
     pub fn poll_send(
         &mut self,
         message: &[u8],
-        message_type: RtcMessageType,
+        message_type: MessageType,
         remote_addr: &SocketAddr,
-    ) -> Poll<(), RtcError> {
+    ) -> Poll<(), SendError> {
         // Send pending UDP messages before potentially buffering new ones
         try_ready!(self.send_udp());
 
         let client = self
             .clients
             .get_mut(remote_addr)
-            .ok_or(RtcError::ClientNotConnected)?;
+            .ok_or(SendError::ClientNotConnected)?;
 
         match client.send_message(message_type, message) {
-            Err(RtcClientError::NotConnected) => {
-                return Err(RtcError::ClientNotConnected);
+            Err(ClientError::NotConnected) => {
+                return Err(SendError::ClientNotConnected);
             }
-            Err(RtcClientError::NotEstablished) => {
-                return Err(RtcError::ClientConnectionNotEstablished);
+            Err(ClientError::NotEstablished) => {
+                return Err(SendError::ClientConnectionNotEstablished);
             }
-            Err(RtcClientError::IncompletePacketWrite) => {
-                return Err(RtcError::IncompleteMessageWrite)
+            Err(ClientError::IncompletePacketWrite) => {
+                return Err(SendError::IncompleteMessageWrite)
             }
             Err(err) => {
                 warn!(
-                    "message send for client {:?} generated unexpected error, shutting down: {}",
+                    "message send for client {} generated unexpected error, shutting down: {}",
                     remote_addr, err
                 );
                 let _ = client.start_shutdown();
-                return Err(RtcError::ClientNotConnected);
+                return Err(SendError::ClientNotConnected);
             }
             Ok(()) => {}
         }
@@ -313,7 +329,7 @@ impl RtcServer {
     /// `poll_recv` *must* be called until it returns Async::NotReady for proper operation of the
     /// server, as it also handles background tasks such as responding to STUN packets and timing
     /// out existing sessions.
-    pub fn poll_recv(&mut self, buf: &mut [u8]) -> Poll<RtcMessageResult, RtcError> {
+    pub fn poll_recv(&mut self, buf: &mut [u8]) -> Poll<MessageResult, RecvError> {
         while self.incoming_rtc.is_empty() {
             try_ready!(self.process());
         }
@@ -323,12 +339,12 @@ impl RtcServer {
         if buf.len() < message_len {
             self.incoming_rtc
                 .push_front((message, remote_addr, message_type));
-            return Err(RtcError::IncompleteMessageRead);
+            return Err(RecvError::IncompleteMessageRead);
         }
 
         buf[0..message_len].copy_from_slice(&message[..]);
 
-        Ok(Async::Ready(RtcMessageResult {
+        Ok(Async::Ready(MessageResult {
             message_len,
             message_type,
             remote_addr,
@@ -337,7 +353,7 @@ impl RtcServer {
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
     // packets, receives incoming UDP packets, and responds to STUN packets.
-    fn process(&mut self) -> Poll<(), RtcInternalError> {
+    fn process(&mut self) -> Poll<(), InternalError> {
         loop {
             match self.incoming_session_stream.poll() {
                 Ok(Async::Ready(Some(incoming_session))) => {
@@ -359,7 +375,7 @@ impl RtcServer {
                 }
                 Ok(Async::NotReady) => break,
                 Ok(Async::Ready(None)) => {
-                    return Err(RtcInternalError::Other(
+                    return Err(InternalError::Other(
                         "connection to RtcSessionEndpoint has unexpectedly closed".into(),
                     ));
                 }
@@ -388,9 +404,9 @@ impl RtcServer {
                     true
                 } else {
                     if !client.is_shutdown() {
-                        info!("connection timeout for client {:?}", remote_addr);
+                        info!("connection timeout for client {}", remote_addr);
                     }
-                    info!("client {:?} removed", remote_addr);
+                    info!("client {} removed", remote_addr);
                     false
                 }
             });
@@ -404,7 +420,7 @@ impl RtcServer {
                 Ok(Async::NotReady) => break,
                 Err(err) => {
                     if err.is_shutdown() {
-                        return Err(RtcInternalError::Other(
+                        return Err(InternalError::Other(
                             "periodic timer has unexpectedly shutdown".into(),
                         ));
                     }
@@ -419,7 +435,7 @@ impl RtcServer {
     // Send any currently queued UDP packets, or if there are currently none queued generate any
     // required periodic UDP packets and send those.  Returns Async::Ready if all queued UDP packets
     // were sent and the queue is now empty.
-    fn send_udp(&mut self) -> Poll<(), RtcInternalError> {
+    fn send_udp(&mut self) -> Poll<(), InternalError> {
         if self.outgoing_udp.is_empty() {
             self.generate_periodic_packets()?;
         }
@@ -428,12 +444,12 @@ impl RtcServer {
             match self
                 .udp_socket
                 .poll_send_to(&packet, &remote_addr)
-                .map_err(RtcInternalError::IoError)?
+                .map_err(InternalError::IoError)?
             {
                 Async::Ready(len) => {
                     let packet_len = packet.len();
                     if len != packet_len {
-                        return Err(RtcInternalError::IoError(IoError::new(
+                        return Err(InternalError::IoError(IoError::new(
                             IoErrorKind::Other,
                             "failed to write entire datagram to socket",
                         )));
@@ -451,15 +467,15 @@ impl RtcServer {
 
     // Handle incoming UDP packets, filling the incoming UDP queue and potentially responding to
     // STUN requests.
-    fn receive_udp(&mut self) -> Poll<(), RtcInternalError> {
+    fn receive_udp(&mut self) -> Poll<(), InternalError> {
         let mut packet_buffer = self.buffer_pool.acquire();
         packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
         let (len, remote_addr) = try_ready!(self
             .udp_socket
             .poll_recv_from(&mut packet_buffer)
-            .map_err(RtcInternalError::IoError));
+            .map_err(InternalError::IoError));
         if len > MAX_UDP_PAYLOAD_SIZE {
-            return Err(RtcInternalError::IoError(IoError::new(
+            return Err(InternalError::IoError(IoError::new(
                 IoErrorKind::Other,
                 "failed to read entire datagram from socket",
             )));
@@ -478,7 +494,7 @@ impl RtcServer {
                     session.server_passwd.as_bytes(),
                     &mut packet_buffer,
                 )
-                .map_err(RtcInternalError::Other)?;
+                .map_err(InternalError::Other)?;
 
                 packet_buffer.truncate(resp_len);
                 self.outgoing_udp.push_back((packet_buffer, remote_addr));
@@ -486,17 +502,13 @@ impl RtcServer {
                 match self.clients.entry(remote_addr) {
                     HashMapEntry::Vacant(vacant) => {
                         info!(
-                            "beginning client data channel connection with {:?}",
+                            "beginning client data channel connection with {}",
                             remote_addr,
                         );
 
                         vacant.insert(
-                            RtcClient::new(
-                                &self.ssl_acceptor,
-                                self.buffer_pool.clone(),
-                                remote_addr,
-                            )
-                            .map_err(|e| RtcInternalError::Other(e.into()))?,
+                            Client::new(&self.ssl_acceptor, self.buffer_pool.clone(), remote_addr)
+                                .map_err(|e| InternalError::Other(e.into()))?,
                         );
                     }
                     HashMapEntry::Occupied(_) => {}
@@ -506,7 +518,7 @@ impl RtcServer {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
                 if let Err(err) = client.receive_incoming_packet(packet_buffer) {
                     warn!(
-                        "client {:?} had unexpected error receiving UDP packet, shutting down: {}",
+                        "client {} had unexpected error receiving UDP packet, shutting down: {}",
                         remote_addr, err
                     );
                     let _ = client.start_shutdown();
@@ -525,13 +537,13 @@ impl RtcServer {
     }
 
     // Call `RtcClient::generate_periodic` on all clients, if we are due to do so.
-    fn generate_periodic_packets(&mut self) -> Result<(), RtcInternalError> {
+    fn generate_periodic_packets(&mut self) -> Result<(), InternalError> {
         if self.last_generate_periodic.elapsed() >= PERIODIC_PACKET_INTERVAL {
             self.last_generate_periodic = Instant::now();
 
             for (remote_addr, client) in &mut self.clients {
                 if let Err(err) = client.generate_periodic() {
-                    warn!("error for client {:?}, shutting down: {}", remote_addr, err);
+                    warn!("error for client {}, shutting down: {}", remote_addr, err);
                     let _ = client.start_shutdown();
                 }
                 self.outgoing_udp

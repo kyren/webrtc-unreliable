@@ -35,7 +35,7 @@ pub const MAX_DTLS_MESSAGE_SIZE: usize = 16384;
 pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
 
 #[derive(Debug)]
-pub enum RtcClientError {
+pub enum ClientError {
     TlsError(SslError),
     OpenSslError(OpenSslErrorStack),
     NotConnected,
@@ -44,41 +44,41 @@ pub enum RtcClientError {
     IncompletePacketWrite,
 }
 
-impl fmt::Display for RtcClientError {
+impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            RtcClientError::TlsError(err) => fmt::Display::fmt(err, f),
-            RtcClientError::OpenSslError(err) => fmt::Display::fmt(err, f),
-            RtcClientError::NotConnected => write!(f, "client is not connected"),
-            RtcClientError::NotEstablished => {
+            ClientError::TlsError(err) => fmt::Display::fmt(err, f),
+            ClientError::OpenSslError(err) => fmt::Display::fmt(err, f),
+            ClientError::NotConnected => write!(f, "client is not connected"),
+            ClientError::NotEstablished => {
                 write!(f, "client does not have an established WebRTC data channel")
             }
-            RtcClientError::IncompletePacketRead => {
+            ClientError::IncompletePacketRead => {
                 write!(f, "WebRTC connection packet not completely read")
             }
-            RtcClientError::IncompletePacketWrite => {
+            ClientError::IncompletePacketWrite => {
                 write!(f, "WebRTC connection packet not completely written")
             }
         }
     }
 }
 
-impl Error for RtcClientError {}
+impl Error for ClientError {}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum RtcMessageType {
+pub enum MessageType {
     Text,
     Binary,
 }
 
-pub struct RtcClient {
+pub struct Client {
     remote_addr: SocketAddr,
     ssl_state: ClientSslState,
 
     last_activity: Instant,
     last_sent: Instant,
 
-    received_messages: Vec<(RtcMessageType, PooledBuffer)>,
+    received_messages: Vec<(MessageType, PooledBuffer)>,
 
     sctp_state: SctpState,
 
@@ -92,12 +92,12 @@ pub struct RtcClient {
     sctp_remote_tsn: u32,
 }
 
-impl RtcClient {
+impl Client {
     pub fn new(
         ssl_acceptor: &SslAcceptor,
         buffer_pool: BufferPool,
         remote_addr: SocketAddr,
-    ) -> Result<RtcClient, OpenSslErrorStack> {
+    ) -> Result<Client, OpenSslErrorStack> {
         match ssl_acceptor.accept(ClientSslPackets {
             buffer_pool: buffer_pool.clone(),
             incoming_udp: VecDeque::new(),
@@ -108,7 +108,7 @@ impl RtcClient {
             Err(HandshakeError::Failure(_)) => {
                 unreachable!("handshake cannot fail before starting")
             }
-            Err(HandshakeError::WouldBlock(mid_handshake)) => Ok(RtcClient {
+            Err(HandshakeError::WouldBlock(mid_handshake)) => Ok(Client {
                 remote_addr,
                 ssl_state: ClientSslState::Unestablished(Some(mid_handshake)),
                 last_activity: Instant::now(),
@@ -139,7 +139,7 @@ impl RtcClient {
     }
 
     /// Request SCTP and DTLS shutdown, connection immediately becomes un-established
-    pub fn start_shutdown(&mut self) -> Result<(), RtcClientError> {
+    pub fn start_shutdown(&mut self) -> Result<(), ClientError> {
         match mem::replace(&mut self.ssl_state, ClientSslState::Unestablished(None)) {
             ClientSslState::Established(mut ssl_stream) => {
                 if self.sctp_state != SctpState::Shutdown {
@@ -182,7 +182,7 @@ impl RtcClient {
     }
 
     /// Generate any periodic packets, currently only heartbeat packets.
-    pub fn generate_periodic(&mut self) -> Result<(), RtcClientError> {
+    pub fn generate_periodic(&mut self) -> Result<(), ClientError> {
         // We send heartbeat packets if the last sent packet was more than HEARTBEAT_INTERVAL ago
         if self.last_sent.elapsed() > HEARTBEAT_INTERVAL {
             match &mut self.ssl_state {
@@ -210,10 +210,7 @@ impl RtcClient {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub fn receive_incoming_packet(
-        &mut self,
-        udp_packet: PooledBuffer,
-    ) -> Result<(), RtcClientError> {
+    pub fn receive_incoming_packet(&mut self, udp_packet: PooledBuffer) -> Result<(), ClientError> {
         match &mut self.ssl_state {
             ClientSslState::Unestablished(maybe_mid_handshake) => {
                 if let Some(mut mid_handshake) = maybe_mid_handshake.take() {
@@ -221,15 +218,15 @@ impl RtcClient {
                     match mid_handshake.handshake() {
                         Ok(ssl_stream) => {
                             self.ssl_state = ClientSslState::Established(ssl_stream);
-                            info!("DTLS handshake finished for remote {:?}", self.remote_addr);
+                            info!("DTLS handshake finished for remote {}", self.remote_addr);
                         }
                         Err(handshake_error) => match handshake_error {
                             HandshakeError::SetupFailure(err) => {
-                                return Err(RtcClientError::OpenSslError(err));
+                                return Err(ClientError::OpenSslError(err));
                             }
                             HandshakeError::Failure(mid_handshake) => {
                                 warn!(
-                                    "SSL handshake failure with remote {:?}: {}",
+                                    "SSL handshake failure with remote {}: {}",
                                     self.remote_addr,
                                     mid_handshake.error()
                                 );
@@ -241,7 +238,7 @@ impl RtcClient {
                         },
                     }
                 } else {
-                    return Err(RtcClientError::NotConnected);
+                    return Err(ClientError::NotConnected);
                 }
             }
             ClientSslState::Established(ssl_stream) => {
@@ -299,21 +296,21 @@ impl RtcClient {
 
     pub fn send_message(
         &mut self,
-        message_type: RtcMessageType,
+        message_type: MessageType,
         message: &[u8],
-    ) -> Result<(), RtcClientError> {
+    ) -> Result<(), ClientError> {
         let ssl_stream = match &mut self.ssl_state {
             ClientSslState::Established(ssl_stream) => ssl_stream,
             _ => {
-                return Err(RtcClientError::NotConnected);
+                return Err(ClientError::NotConnected);
             }
         };
 
         if self.sctp_state != SctpState::Established {
-            return Err(RtcClientError::NotEstablished);
+            return Err(ClientError::NotEstablished);
         }
 
-        let proto_id = if message_type == RtcMessageType::Text {
+        let proto_id = if message_type == MessageType::Text {
             DATA_CHANNEL_PROTO_STRING
         } else {
             DATA_CHANNEL_PROTO_BINARY
@@ -342,11 +339,11 @@ impl RtcClient {
 
     pub fn receive_messages<'a>(
         &'a mut self,
-    ) -> impl Iterator<Item = (RtcMessageType, PooledBuffer)> + 'a {
+    ) -> impl Iterator<Item = (MessageType, PooledBuffer)> + 'a {
         self.received_messages.drain(..)
     }
 
-    fn receive_sctp_packet(&mut self, sctp_packet: &SctpPacket) -> Result<(), RtcClientError> {
+    fn receive_sctp_packet(&mut self, sctp_packet: &SctpPacket) -> Result<(), ClientError> {
         let ssl_stream = match &mut self.ssl_state {
             ClientSslState::Established(ssl_stream) => ssl_stream,
             _ => panic!("receive_sctp_packet called in ssl unestablished state"),
@@ -447,13 +444,11 @@ impl RtcClient {
                     } else if proto_id == DATA_CHANNEL_PROTO_STRING {
                         let mut msg_buffer = ssl_stream.get_ref().buffer_pool.acquire();
                         msg_buffer.extend(user_data);
-                        self.received_messages
-                            .push((RtcMessageType::Text, msg_buffer));
+                        self.received_messages.push((MessageType::Text, msg_buffer));
                     } else if proto_id == DATA_CHANNEL_PROTO_BINARY {
                         let mut msg_buffer = ssl_stream.get_ref().buffer_pool.acquire();
                         msg_buffer.extend(user_data);
-                        self.received_messages
-                            .push((RtcMessageType::Text, msg_buffer));
+                        self.received_messages.push((MessageType::Text, msg_buffer));
                     }
 
                     send_sctp_packet(
@@ -558,7 +553,7 @@ impl Read for ClientSslPackets {
             if next_packet.len() > buf.len() {
                 return Err(IoError::new(
                     IoErrorKind::Other,
-                    RtcClientError::IncompletePacketRead,
+                    ClientError::IncompletePacketRead,
                 ));
             }
             buf[0..next_packet.len()].copy_from_slice(&next_packet);
@@ -601,10 +596,10 @@ enum SctpState {
     Established,
 }
 
-fn ssl_err_to_client_err(err: SslError) -> RtcClientError {
+fn ssl_err_to_client_err(err: SslError) -> ClientError {
     if let Some(io_err) = err.io_error() {
         if let Some(inner) = io_err.get_ref() {
-            if inner.is::<RtcClientError>() {
+            if inner.is::<ClientError>() {
                 return *err
                     .into_io_error()
                     .unwrap()
@@ -616,7 +611,7 @@ fn ssl_err_to_client_err(err: SslError) -> RtcClientError {
         }
     }
 
-    RtcClientError::TlsError(err)
+    ClientError::TlsError(err)
 }
 
 fn max_tsn(a: u32, b: u32) -> u32 {
@@ -638,14 +633,14 @@ fn max_tsn(a: u32, b: u32) -> u32 {
 fn send_sctp_packet(
     ssl_stream: &mut SslStream<ClientSslPackets>,
     sctp_packet: SctpPacket,
-) -> Result<(), RtcClientError> {
+) -> Result<(), ClientError> {
     let mut sctp_buffer = ssl_stream.get_ref().buffer_pool.acquire();
     sctp_buffer.resize(MAX_SCTP_PACKET_SIZE, 0);
 
     let packet_len = match write_sctp_packet(&mut sctp_buffer, sctp_packet) {
         Ok(len) => len,
         Err(SctpWriteError::BufferSize) => {
-            return Err(RtcClientError::IncompletePacketWrite);
+            return Err(ClientError::IncompletePacketWrite);
         }
         Err(err) => panic!("error writing SCTP packet: {}", err),
     };

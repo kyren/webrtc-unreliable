@@ -12,7 +12,10 @@ use hyper::{
 use log::{info, warn};
 use tokio::runtime::Runtime;
 
-use webrtc_unreliable::{RtcError, RtcMessageResult, RtcServer};
+use webrtc_unreliable::{
+    MessageResult as RtcMessageResult, RecvError as RtcRecvError, SendError as RtcSendError,
+    Server as RtcServer,
+};
 
 fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -79,7 +82,7 @@ fn main() {
                     if req.uri().path() == "/"
                         || req.uri().path() == "/index.html" && req.method() == Method::GET
                     {
-                        info!("serving example index HTML to {:?}", remote_addr);
+                        info!("serving example index HTML to {}", remote_addr);
                         Either::A(
                             Response::builder()
                                 .body(Body::from(include_str!("./echo_server.html")))
@@ -87,7 +90,7 @@ fn main() {
                         )
                     } else if req.uri().path() == "/new_rtc_session" && req.method() == Method::POST
                     {
-                        info!("WebRTC session request from {:?}", remote_addr);
+                        info!("WebRTC session request from {}", remote_addr);
                         Either::B(
                             session_endpoint
                                 .http_session_request(req.into_body())
@@ -134,9 +137,11 @@ fn main() {
                         received_message = Some(received);
                         return Ok(Async::NotReady);
                     }
-                    Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
+                    Err(RtcSendError::Internal(err)) => {
+                        panic!("internal WebRTC server error: {}", err)
+                    }
                     Err(err) => warn!(
-                        "could not send message to {:?}: {}",
+                        "could not send message to {}: {}",
                         received.remote_addr, err
                     ),
                 }
@@ -146,7 +151,7 @@ fn main() {
                     received_message = Some(incoming_message);
                 }
                 Ok(Async::NotReady) => return Ok(Async::NotReady),
-                Err(RtcError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
+                Err(RtcRecvError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
                 Err(err) => warn!("could not receive RTC message: {}", err),
             },
         }

@@ -63,6 +63,8 @@ impl Crypto {
         // This should prevent MITM attacks against the DTLS connection (tricking the client to
         // connect to some other server than the verified one).  Client authentication (such as
         // username / password) can then be handled through the resulting WebRTC data channel.
+        //
+        // TODO: Somebody who is actually good at this stuff should verify this.
         ssl_acceptor_builder.set_verify(SslVerifyMode::NONE);
 
         ssl_acceptor_builder.set_private_key(&key)?;
