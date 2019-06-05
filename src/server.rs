@@ -51,6 +51,8 @@ impl fmt::Display for SendError {
     }
 }
 
+impl Error for SendError {}
+
 impl From<InternalError> for SendError {
     fn from(err: InternalError) -> SendError {
         SendError::Internal(err)
@@ -65,6 +67,7 @@ pub enum RecvError {
     /// Other generally fatal internal errors.
     Internal(InternalError),
 }
+
 impl Error for RecvError {}
 
 impl fmt::Display for RecvError {
