@@ -195,7 +195,7 @@ impl SessionEndpoint {
 pub struct Server {
     udp_socket: UdpSocket,
     session_endpoint: SessionEndpoint,
-    incoming_session_stream: Box<Stream<Item = IncomingSession, Error = ()> + Send>,
+    incoming_session_stream: Box<dyn Stream<Item = IncomingSession, Error = ()> + Send>,
     ssl_acceptor: SslAcceptor,
     outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
     incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, MessageType)>,
@@ -564,7 +564,7 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const PERIODIC_PACKET_INTERVAL: Duration = Duration::from_secs(1);
 const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
 
-type BoxError = Box<Error + Send + Sync>;
+type BoxError = Box<dyn Error + Send + Sync>;
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct SessionKey {
