@@ -13,7 +13,7 @@ use log::{debug, info, warn};
 use openssl::{
     error::ErrorStack as OpenSslErrorStack,
     ssl::{
-        Error as SslError, ErrorCode, HandshakeError, MidHandshakeSslStream, ShutdownState,
+        Error as SslError, ErrorCode, HandshakeError, MidHandshakeSslStream, ShutdownResult,
         SslAcceptor, SslStream,
     },
 };
@@ -110,7 +110,7 @@ impl Client {
             }
             Err(HandshakeError::WouldBlock(mid_handshake)) => Ok(Client {
                 remote_addr,
-                ssl_state: ClientSslState::Unestablished(Some(mid_handshake)),
+                ssl_state: ClientSslState::Handshake(mid_handshake),
                 last_activity: Instant::now(),
                 last_sent: Instant::now(),
                 received_messages: Vec::new(),
@@ -140,11 +140,10 @@ impl Client {
 
     /// Request SCTP and DTLS shutdown, connection immediately becomes un-established
     pub fn start_shutdown(&mut self) -> Result<(), ClientError> {
-        match mem::replace(&mut self.ssl_state, ClientSslState::Unestablished(None)) {
+        self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Established(mut ssl_stream) => {
                 if self.sctp_state != SctpState::Shutdown {
-                    // We only send one abort packet because the DTLS connection is closed
-                    // immediately after this.
+                    // TODO: For now, we just do an immediate one-sided SCTP abort
                     send_sctp_packet(
                         &mut ssl_stream,
                         SctpPacket {
@@ -157,26 +156,20 @@ impl Client {
                     self.last_sent = Instant::now();
                     self.sctp_state = SctpState::Shutdown;
                 }
-                ssl_stream.shutdown().map_err(ssl_err_to_client_err)?;
-                self.ssl_state = ClientSslState::Shutdown(ssl_stream);
+                match ssl_stream.shutdown().map_err(ssl_err_to_client_err)? {
+                    ShutdownResult::Sent => ClientSslState::ShuttingDown(ssl_stream),
+                    ShutdownResult::Received => ClientSslState::Shutdown,
+                }
             }
-            _ => {}
-        }
+            prev_state => prev_state,
+        };
         Ok(())
     }
 
     /// Connection has either timed out or finished shutting down
-    pub fn is_shutdown(&mut self) -> bool {
-        match &mut self.ssl_state {
-            ClientSslState::Unestablished(None) => true,
-            ClientSslState::Shutdown(ssl_stream) => {
-                if ssl_stream.get_shutdown().contains(ShutdownState::RECEIVED) {
-                    self.ssl_state = ClientSslState::Unestablished(None);
-                    true
-                } else {
-                    false
-                }
-            }
+    pub fn is_shutdown(&self) -> bool {
+        match &self.ssl_state {
+            ClientSslState::Shutdown => true,
             _ => false,
         }
     }
@@ -211,46 +204,52 @@ impl Client {
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
     pub fn receive_incoming_packet(&mut self, udp_packet: PooledBuffer) -> Result<(), ClientError> {
-        match &mut self.ssl_state {
-            ClientSslState::Unestablished(maybe_mid_handshake) => {
-                if let Some(mut mid_handshake) = maybe_mid_handshake.take() {
-                    mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
-                    match mid_handshake.handshake() {
-                        Ok(ssl_stream) => {
-                            self.ssl_state = ClientSslState::Established(ssl_stream);
-                            info!("DTLS handshake finished for remote {}", self.remote_addr);
-                        }
-                        Err(handshake_error) => match handshake_error {
-                            HandshakeError::SetupFailure(err) => {
-                                return Err(ClientError::OpenSslError(err));
-                            }
-                            HandshakeError::Failure(mid_handshake) => {
-                                warn!(
-                                    "SSL handshake failure with remote {}: {}",
-                                    self.remote_addr,
-                                    mid_handshake.error()
-                                );
-                                self.ssl_state = ClientSslState::Unestablished(Some(mid_handshake));
-                            }
-                            HandshakeError::WouldBlock(mid_handshake) => {
-                                self.ssl_state = ClientSslState::Unestablished(Some(mid_handshake));
-                            }
-                        },
+        self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
+            ClientSslState::Handshake(mut mid_handshake) => {
+                mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
+                match mid_handshake.handshake() {
+                    Ok(ssl_stream) => {
+                        info!("DTLS handshake finished for remote {}", self.remote_addr);
+                        ClientSslState::Established(ssl_stream)
                     }
-                } else {
-                    return Err(ClientError::NotConnected);
+                    Err(handshake_error) => match handshake_error {
+                        HandshakeError::SetupFailure(err) => {
+                            return Err(ClientError::OpenSslError(err));
+                        }
+                        HandshakeError::Failure(mid_handshake) => {
+                            warn!(
+                                "SSL handshake failure with remote {}: {}",
+                                self.remote_addr,
+                                mid_handshake.error()
+                            );
+                            ClientSslState::Handshake(mid_handshake)
+                        }
+                        HandshakeError::WouldBlock(mid_handshake) => {
+                            ClientSslState::Handshake(mid_handshake)
+                        }
+                    },
                 }
             }
-            ClientSslState::Established(ssl_stream) => {
+            ClientSslState::Established(mut ssl_stream) => {
                 ssl_stream.get_mut().incoming_udp.push_back(udp_packet);
+                ClientSslState::Established(ssl_stream)
             }
-            ClientSslState::Shutdown(ssl_stream) => {
+            ClientSslState::ShuttingDown(mut ssl_stream) => {
                 ssl_stream.get_mut().incoming_udp.push_back(udp_packet);
-                if ssl_stream.get_shutdown() == ShutdownState::RECEIVED {
-                    self.ssl_state = ClientSslState::Unestablished(None);
+                match ssl_stream.shutdown() {
+                    Err(err) => {
+                        if err.code() == ErrorCode::WANT_READ {
+                            ClientSslState::ShuttingDown(ssl_stream)
+                        } else {
+                            return Err(ssl_err_to_client_err(err));
+                        }
+                    }
+                    Ok(ShutdownResult::Sent) => ClientSslState::ShuttingDown(ssl_stream),
+                    Ok(ShutdownResult::Received) => ClientSslState::Shutdown,
                 }
             }
-        }
+            ClientSslState::Shutdown => return Err(ClientError::NotConnected),
+        };
 
         while let ClientSslState::Established(ssl_stream) = &mut self.ssl_state {
             let mut ssl_buffer = ssl_stream.get_ref().buffer_pool.acquire();
@@ -270,6 +269,9 @@ impl Client {
                 Err(err) => {
                     if err.code() == ErrorCode::WANT_READ {
                         break;
+                    } else if err.code() == ErrorCode::ZERO_RETURN {
+                        info!("DTLS received close notify");
+                        self.start_shutdown()?;
                     } else {
                         return Err(ssl_err_to_client_err(err));
                     }
@@ -282,13 +284,13 @@ impl Client {
 
     pub fn take_outgoing_packets<'a>(&'a mut self) -> impl Iterator<Item = PooledBuffer> + 'a {
         (match &mut self.ssl_state {
-            ClientSslState::Unestablished(Some(mid_handshake)) => {
+            ClientSslState::Handshake(mid_handshake) => {
                 Some(mid_handshake.get_mut().outgoing_udp.drain(..))
             }
-            ClientSslState::Unestablished(None) => None,
-            ClientSslState::Established(ssl_stream) | ClientSslState::Shutdown(ssl_stream) => {
+            ClientSslState::Established(ssl_stream) | ClientSslState::ShuttingDown(ssl_stream) => {
                 Some(ssl_stream.get_mut().outgoing_udp.drain(..))
             }
+            ClientSslState::Shutdown => None,
         })
         .into_iter()
         .flatten()
@@ -520,7 +522,7 @@ impl Client {
                 }
                 SctpChunk::ShutdownAck { .. } | SctpChunk::Abort => {
                     self.sctp_state = SctpState::Shutdown;
-                    ssl_stream.shutdown().map_err(ssl_err_to_client_err)?;
+                    return self.start_shutdown();
                 }
                 SctpChunk::ForwardTsn { new_cumulative_tsn } => {
                     self.sctp_remote_tsn = new_cumulative_tsn;
@@ -535,9 +537,10 @@ impl Client {
 }
 
 enum ClientSslState {
-    Unestablished(Option<MidHandshakeSslStream<ClientSslPackets>>),
+    Handshake(MidHandshakeSslStream<ClientSslPackets>),
     Established(SslStream<ClientSslPackets>),
-    Shutdown(SslStream<ClientSslPackets>),
+    ShuttingDown(SslStream<ClientSslPackets>),
+    Shutdown,
 }
 
 #[derive(Debug)]
