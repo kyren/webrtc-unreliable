@@ -450,7 +450,7 @@ impl Client {
                     } else if proto_id == DATA_CHANNEL_PROTO_BINARY {
                         let mut msg_buffer = ssl_stream.get_ref().buffer_pool.acquire();
                         msg_buffer.extend(user_data);
-                        self.received_messages.push((MessageType::Text, msg_buffer));
+                        self.received_messages.push((MessageType::Binary, msg_buffer));
                     }
 
                     send_sctp_packet(
