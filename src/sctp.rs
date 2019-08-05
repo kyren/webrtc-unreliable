@@ -427,7 +427,7 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 initial_tsn,
                 state_cookie,
             } => {
-                let data_len = 20 + state_cookie.len();
+                let data_len = 24 + state_cookie.len();
                 if chunk_data.len() < data_len {
                     return Err(SctpWriteError::BufferSize);
                 }
@@ -437,15 +437,19 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 NetworkEndian::write_u16(&mut chunk_data[8..10], num_outbound_streams);
                 NetworkEndian::write_u16(&mut chunk_data[10..12], num_inbound_streams);
                 NetworkEndian::write_u32(&mut chunk_data[12..16], initial_tsn);
-                NetworkEndian::write_u16(&mut chunk_data[16..18], INIT_ACK_PARAM_STATE_COOKIE);
+
+                NetworkEndian::write_u16(&mut chunk_data[16..18], INIT_PARAM_FORWARD_TSN);
+                NetworkEndian::write_u16(&mut chunk_data[18..20], 4);
+
+                NetworkEndian::write_u16(&mut chunk_data[20..22], INIT_ACK_PARAM_STATE_COOKIE);
                 NetworkEndian::write_u16(
-                    &mut chunk_data[18..20],
+                    &mut chunk_data[22..24],
                     (state_cookie.len() + 4)
                         .try_into()
                         .map_err(|_| SctpWriteError::OutOfRange)?,
                 );
 
-                chunk_data[20..data_len].copy_from_slice(state_cookie);
+                chunk_data[24..data_len].copy_from_slice(state_cookie);
 
                 (CHUNK_TYPE_INIT_ACK, 0, data_len)
             }
