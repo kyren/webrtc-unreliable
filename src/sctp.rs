@@ -198,13 +198,18 @@ pub fn read_sctp_packet<'a>(
                         return Err(SctpReadError::BadPacket);
                     }
 
-                    let param_type = NetworkEndian::read_u16(&chunk_data[16..18]);
-                    let param_len = NetworkEndian::read_u16(&chunk_data[18..20]);
-
-                    if param_type != INIT_ACK_PARAM_STATE_COOKIE
-                        || 16 + param_len as usize > chunk_data.len()
-                    {
-                        return Err(SctpReadError::BadPacket);
+                    let mut state_cookie = None;
+                    for param in iter_params(&chunk_data, 16) {
+                        match param {
+                            Ok((ty, data)) => {
+                                if ty == INIT_ACK_PARAM_STATE_COOKIE {
+                                    state_cookie = Some(data);
+                                }
+                            }
+                            Err(_) => {
+                                return Err(SctpReadError::BadPacket);
+                            }
+                        }
                     }
 
                     *chunk = SctpChunk::InitAck {
@@ -213,7 +218,7 @@ pub fn read_sctp_packet<'a>(
                         num_outbound_streams,
                         num_inbound_streams,
                         initial_tsn,
-                        state_cookie: &chunk_data[20..16 + param_len as usize],
+                        state_cookie: state_cookie.ok_or_else(|| SctpReadError::BadPacket)?,
                     };
                 }
             }
