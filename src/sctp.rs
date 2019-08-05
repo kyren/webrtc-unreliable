@@ -26,6 +26,7 @@ pub enum SctpChunk<'a> {
         num_outbound_streams: u16,
         num_inbound_streams: u16,
         initial_tsn: u32,
+        support_unreliable: bool,
     },
     InitAck {
         initiate_tag: u32,
@@ -171,12 +172,26 @@ pub fn read_sctp_packet<'a>(
                 let initial_tsn = NetworkEndian::read_u32(&chunk_data[12..16]);
 
                 if chunk_type == CHUNK_TYPE_INIT {
+                    let mut support_unreliable = false;
+                    for param in iter_params(&chunk_data, 16) {
+                        match param {
+                            Err(_) => return Err(SctpReadError::BadPacket),
+                            Ok((ty, _)) => {
+                                if ty == INIT_PARAM_FORWARD_TSN {
+                                    support_unreliable = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     *chunk = SctpChunk::Init {
                         initiate_tag,
                         window_credit,
                         num_outbound_streams,
                         num_inbound_streams,
                         initial_tsn,
+                        support_unreliable,
                     };
                 } else {
                     if chunk_data.len() < 20 {
@@ -378,8 +393,9 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 num_outbound_streams,
                 num_inbound_streams,
                 initial_tsn,
+                support_unreliable,
             } => {
-                let data_len = 16;
+                let data_len = 16 + if support_unreliable { 4 } else { 0 };
                 if chunk_data.len() < data_len {
                     return Err(SctpWriteError::BufferSize);
                 }
@@ -389,6 +405,12 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
                 NetworkEndian::write_u16(&mut chunk_data[8..10], num_outbound_streams);
                 NetworkEndian::write_u16(&mut chunk_data[10..12], num_inbound_streams);
                 NetworkEndian::write_u32(&mut chunk_data[12..16], initial_tsn);
+
+                // forward tsn parameter
+                if support_unreliable {
+                    NetworkEndian::write_u16(&mut chunk_data[16..18], INIT_PARAM_FORWARD_TSN);
+                    NetworkEndian::write_u16(&mut chunk_data[18..20], 4);
+                }
 
                 (CHUNK_TYPE_INIT, 0, data_len)
             }
@@ -549,7 +571,45 @@ const CHUNK_TYPE_ASCONF: u8 = 0xc1;
 const CHUNK_TYPE_I_FORWARD_TSN: u8 = 0xc2;
 
 const INIT_ACK_PARAM_STATE_COOKIE: u16 = 0x07;
+const INIT_PARAM_FORWARD_TSN: u16 = 0xc000;
 const HEARTBEAT_PARAM_INFO: u16 = 0x07;
+
+enum IterParamsError {
+    BufferSize,
+}
+
+fn iter_params<'a>(
+    data: &'a [u8],
+    start: usize,
+) -> impl Iterator<Item = Result<(u16, &'a [u8]), IterParamsError>> + 'a {
+    struct ParamIterator<'a> {
+        data: &'a [u8],
+        index: usize,
+    };
+
+    impl<'a> Iterator for ParamIterator<'a> {
+        type Item = Result<(u16, &'a [u8]), IterParamsError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.data.len() < self.index + 4 {
+                return None;
+            }
+
+            let ty = NetworkEndian::read_u16(&self.data[self.index..self.index + 2]);
+            let len = NetworkEndian::read_u16(&self.data[self.index + 2..self.index + 4]) as usize;
+
+            if self.data.len() < self.index + len {
+                return Some(Err(IterParamsError::BufferSize));
+            }
+
+            let res = Some(Ok((ty, &self.data[self.index + 4..self.index + len])));
+            self.index = next_multiple(self.index + len, 4);
+            res
+        }
+    }
+
+    ParamIterator { data, index: start }
+}
 
 fn next_multiple(s: usize, m: usize) -> usize {
     if s % m == 0 {
