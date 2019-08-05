@@ -536,6 +536,15 @@ impl Client {
                     self.sctp_remote_tsn = new_cumulative_tsn;
                 }
                 SctpChunk::InitAck { .. } | SctpChunk::CookieAck => {}
+                SctpChunk::Error {
+                    first_param_type,
+                    first_param_data,
+                } => {
+                    warn!(
+                        "SCTP error chunk received: {} {:?}",
+                        first_param_type, first_param_data
+                    );
+                }
                 chunk => debug!("unhandled SCTP chunk {:?}", chunk),
             }
         }

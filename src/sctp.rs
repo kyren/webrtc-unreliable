@@ -53,7 +53,10 @@ pub enum SctpChunk<'a> {
         cumulative_tsn_ack: u32,
     },
     ShutdownAck,
-    Error,
+    Error {
+        first_param_type: u16,
+        first_param_data: &'a [u8],
+    },
     CookieEcho {
         state_cookie: &'a [u8],
     },
@@ -272,7 +275,15 @@ pub fn read_sctp_packet<'a>(
                 *chunk = SctpChunk::ShutdownAck;
             }
             CHUNK_TYPE_ERROR => {
-                *chunk = SctpChunk::Error;
+                let (first_param_type, first_param_data) = iter_params(&chunk_data, 0)
+                    .next()
+                    .ok_or_else(|| SctpReadError::BadPacket)
+                    .and_then(|v| v.map_err(|_| SctpReadError::BadPacket))?;
+
+                *chunk = SctpChunk::Error {
+                    first_param_type,
+                    first_param_data,
+                };
             }
             CHUNK_TYPE_COOKIE_ECHO => {
                 *chunk = SctpChunk::CookieEcho {
