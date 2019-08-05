@@ -197,22 +197,13 @@ pub fn read_sctp_packet<'a>(
                         support_unreliable,
                     };
                 } else {
-                    if chunk_data.len() < 20 {
+                    let (param_type, param_data) = iter_params(&chunk_data, 16)
+                        .next()
+                        .ok_or_else(|| SctpReadError::BadPacket)
+                        .and_then(|v| v.map_err(|_| SctpReadError::BadPacket))?;
+                    // first parameter must be the state cookie
+                    if param_type != INIT_ACK_PARAM_STATE_COOKIE {
                         return Err(SctpReadError::BadPacket);
-                    }
-
-                    let mut state_cookie = None;
-                    for param in iter_params(&chunk_data, 16) {
-                        match param {
-                            Ok((ty, data)) => {
-                                if ty == INIT_ACK_PARAM_STATE_COOKIE {
-                                    state_cookie = Some(data);
-                                }
-                            }
-                            Err(_) => {
-                                return Err(SctpReadError::BadPacket);
-                            }
-                        }
                     }
 
                     *chunk = SctpChunk::InitAck {
@@ -221,7 +212,7 @@ pub fn read_sctp_packet<'a>(
                         num_outbound_streams,
                         num_inbound_streams,
                         initial_tsn,
-                        state_cookie: state_cookie.ok_or_else(|| SctpReadError::BadPacket)?,
+                        state_cookie: param_data,
                     };
                 }
             }
