@@ -359,7 +359,14 @@ impl Client {
                     num_outbound_streams,
                     num_inbound_streams,
                     initial_tsn,
+                    support_unreliable,
                 } => {
+                    if !support_unreliable {
+                        warn!("peer does not support selective unreliability, abort connection");
+                        self.sctp_state = SctpState::Shutdown;
+                        return self.start_shutdown();
+                    }
+
                     let mut rng = thread_rng();
 
                     self.sctp_local_port = sctp_packet.dest_port;
@@ -450,7 +457,8 @@ impl Client {
                     } else if proto_id == DATA_CHANNEL_PROTO_BINARY {
                         let mut msg_buffer = ssl_stream.get_ref().buffer_pool.acquire();
                         msg_buffer.extend(user_data);
-                        self.received_messages.push((MessageType::Binary, msg_buffer));
+                        self.received_messages
+                            .push((MessageType::Binary, msg_buffer));
                     }
 
                     send_sctp_packet(
@@ -528,6 +536,15 @@ impl Client {
                     self.sctp_remote_tsn = new_cumulative_tsn;
                 }
                 SctpChunk::InitAck { .. } | SctpChunk::CookieAck => {}
+                SctpChunk::Error {
+                    first_param_type,
+                    first_param_data,
+                } => {
+                    warn!(
+                        "SCTP error chunk received: {} {:?}",
+                        first_param_type, first_param_data
+                    );
+                }
                 chunk => debug!("unhandled SCTP chunk {:?}", chunk),
             }
         }
