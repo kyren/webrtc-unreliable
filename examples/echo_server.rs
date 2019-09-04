@@ -12,10 +12,7 @@ use hyper::{
 use log::{info, warn};
 use tokio::runtime::Runtime;
 
-use webrtc_unreliable::{
-    MessageResult as RtcMessageResult, RecvError as RtcRecvError, SendError as RtcSendError,
-    Server as RtcServer,
-};
+use webrtc_unreliable::{MessageResult as RtcMessageResult, Server as RtcServer};
 
 fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -137,9 +134,6 @@ fn main() {
                         received_message = Some(received);
                         return Ok(Async::NotReady);
                     }
-                    Err(RtcSendError::Internal(err)) => {
-                        panic!("internal WebRTC server error: {}", err)
-                    }
                     Err(err) => warn!(
                         "could not send message to {}: {}",
                         received.remote_addr, err
@@ -151,7 +145,6 @@ fn main() {
                     received_message = Some(incoming_message);
                 }
                 Ok(Async::NotReady) => return Ok(Async::NotReady),
-                Err(RtcRecvError::Internal(err)) => panic!("internal WebRTC server error: {}", err),
                 Err(err) => warn!("could not receive RTC message: {}", err),
             },
         }

@@ -32,8 +32,9 @@ pub enum SendError {
     /// Non-fatal error writing a WebRTC Data Channel message that is too large to fit in the
     /// maximum message size.
     IncompleteMessageWrite,
-    /// Other generally fatal internal errors.
-    Internal(InternalError),
+    /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
+    /// error.
+    IoError(IoError),
 }
 
 impl fmt::Display for SendError {
@@ -46,16 +47,16 @@ impl fmt::Display for SendError {
             SendError::IncompleteMessageWrite => {
                 write!(f, "incomplete write of WebRTC Data Channel message")
             }
-            SendError::Internal(err) => fmt::Display::fmt(err, f),
+            SendError::IoError(err) => fmt::Display::fmt(err, f),
         }
     }
 }
 
 impl Error for SendError {}
 
-impl From<InternalError> for SendError {
-    fn from(err: InternalError) -> SendError {
-        SendError::Internal(err)
+impl From<IoError> for SendError {
+    fn from(err: IoError) -> SendError {
+        SendError::IoError(err)
     }
 }
 
@@ -64,11 +65,10 @@ pub enum RecvError {
     /// Non-fatal error reading a WebRTC Data Channel message that is too large to fit in the
     /// provided buffer.
     IncompleteMessageRead,
-    /// Other generally fatal internal errors.
-    Internal(InternalError),
+    /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
+    /// error.
+    IoError(IoError),
 }
-
-impl Error for RecvError {}
 
 impl fmt::Display for RecvError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -76,34 +76,18 @@ impl fmt::Display for RecvError {
             RecvError::IncompleteMessageRead => {
                 write!(f, "incomplete read of WebRTC Data Channel message")
             }
-            RecvError::Internal(err) => fmt::Display::fmt(err, f),
+            RecvError::IoError(err) => fmt::Display::fmt(err, f),
         }
     }
 }
 
-impl From<InternalError> for RecvError {
-    fn from(err: InternalError) -> RecvError {
-        RecvError::Internal(err)
+impl Error for RecvError {}
+
+impl From<IoError> for RecvError {
+    fn from(err: IoError) -> RecvError {
+        RecvError::IoError(err)
     }
 }
-
-/// Generally fatal internal error in the WebRTC server.
-#[derive(Debug)]
-pub enum InternalError {
-    IoError(IoError),
-    Other(BoxError),
-}
-
-impl fmt::Display for InternalError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        match self {
-            InternalError::IoError(err) => fmt::Display::fmt(err, f),
-            InternalError::Other(err) => fmt::Display::fmt(err, f),
-        }
-    }
-}
-
-impl Error for InternalError {}
 
 #[derive(Copy, Clone, Debug)]
 pub struct MessageResult {
@@ -213,11 +197,11 @@ impl Server {
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
     /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
-    pub fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, InternalError> {
+    pub fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, IoError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 
         let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
-        let udp_socket = UdpSocket::bind(&listen_addr).map_err(InternalError::IoError)?;
+        let udp_socket = UdpSocket::bind(&listen_addr)?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
 
@@ -357,7 +341,7 @@ impl Server {
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
     // packets, receives incoming UDP packets, and responds to STUN packets.
-    fn process(&mut self) -> Poll<(), InternalError> {
+    fn process(&mut self) -> Poll<(), IoError> {
         loop {
             match self.incoming_session_stream.poll() {
                 Ok(Async::Ready(Some(incoming_session))) => {
@@ -377,12 +361,8 @@ impl Server {
                         },
                     );
                 }
+                Ok(Async::Ready(None)) => panic!("connection to RtcSessionEndpoint has closed"),
                 Ok(Async::NotReady) => break,
-                Ok(Async::Ready(None)) => {
-                    return Err(InternalError::Other(
-                        "connection to RtcSessionEndpoint has unexpectedly closed".into(),
-                    ));
-                }
                 Err(_) => unreachable!(),
             }
         }
@@ -424,9 +404,7 @@ impl Server {
                 Ok(Async::NotReady) => break,
                 Err(err) => {
                     if err.is_shutdown() {
-                        return Err(InternalError::Other(
-                            "periodic timer has unexpectedly shutdown".into(),
-                        ));
+                        panic!("periodic timer has unexpectedly shutdown");
                     }
                 }
             }
@@ -439,24 +417,20 @@ impl Server {
     // Send any currently queued UDP packets, or if there are currently none queued generate any
     // required periodic UDP packets and send those.  Returns Async::Ready if all queued UDP packets
     // were sent and the queue is now empty.
-    fn send_udp(&mut self) -> Poll<(), InternalError> {
+    fn send_udp(&mut self) -> Poll<(), IoError> {
         if self.outgoing_udp.is_empty() {
-            self.generate_periodic_packets()?;
+            self.generate_periodic_packets();
         }
 
         while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
-            match self
-                .udp_socket
-                .poll_send_to(&packet, &remote_addr)
-                .map_err(InternalError::IoError)?
-            {
+            match self.udp_socket.poll_send_to(&packet, &remote_addr)? {
                 Async::Ready(len) => {
                     let packet_len = packet.len();
                     if len != packet_len {
-                        return Err(InternalError::IoError(IoError::new(
+                        return Err(IoError::new(
                             IoErrorKind::Other,
                             "failed to write entire datagram to socket",
-                        )));
+                        ));
                     }
                 }
                 Async::NotReady => {
@@ -471,18 +445,15 @@ impl Server {
 
     // Handle incoming UDP packets, filling the incoming UDP queue and potentially responding to
     // STUN requests.
-    fn receive_udp(&mut self) -> Poll<(), InternalError> {
+    fn receive_udp(&mut self) -> Poll<(), IoError> {
         let mut packet_buffer = self.buffer_pool.acquire();
         packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
-        let (len, remote_addr) = try_ready!(self
-            .udp_socket
-            .poll_recv_from(&mut packet_buffer)
-            .map_err(InternalError::IoError));
+        let (len, remote_addr) = try_ready!(self.udp_socket.poll_recv_from(&mut packet_buffer));
         if len > MAX_UDP_PAYLOAD_SIZE {
-            return Err(InternalError::IoError(IoError::new(
+            return Err(IoError::new(
                 IoErrorKind::Other,
                 "failed to read entire datagram from socket",
-            )));
+            ));
         }
         packet_buffer.truncate(len);
 
@@ -498,7 +469,7 @@ impl Server {
                     session.server_passwd.as_bytes(),
                     &mut packet_buffer,
                 )
-                .map_err(InternalError::Other)?;
+                .expect("could not write stun response");
 
                 packet_buffer.truncate(resp_len);
                 self.outgoing_udp.push_back((packet_buffer, remote_addr));
@@ -512,7 +483,7 @@ impl Server {
 
                         vacant.insert(
                             Client::new(&self.ssl_acceptor, self.buffer_pool.clone(), remote_addr)
-                                .map_err(|e| InternalError::Other(e.into()))?,
+                                .expect("could not create new client instance"),
                         );
                     }
                     HashMapEntry::Occupied(_) => {}
@@ -541,7 +512,7 @@ impl Server {
     }
 
     // Call `RtcClient::generate_periodic` on all clients, if we are due to do so.
-    fn generate_periodic_packets(&mut self) -> Result<(), InternalError> {
+    fn generate_periodic_packets(&mut self) {
         if self.last_generate_periodic.elapsed() >= PERIODIC_PACKET_INTERVAL {
             self.last_generate_periodic = Instant::now();
 
@@ -554,7 +525,6 @@ impl Server {
                     .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
             }
         }
-        Ok(())
     }
 }
 

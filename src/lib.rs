@@ -8,4 +8,4 @@ mod stun;
 mod util;
 
 pub use client::MessageType;
-pub use server::{InternalError, MessageResult, RecvError, SendError, Server, SessionEndpoint};
+pub use server::{MessageResult, RecvError, SendError, Server, SessionEndpoint};
