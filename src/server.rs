@@ -34,7 +34,7 @@ pub enum SendError {
     IncompleteMessageWrite,
     /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
     /// error.
-    IoError(IoError),
+    Io(IoError),
 }
 
 impl fmt::Display for SendError {
@@ -47,7 +47,7 @@ impl fmt::Display for SendError {
             SendError::IncompleteMessageWrite => {
                 write!(f, "incomplete write of WebRTC Data Channel message")
             }
-            SendError::IoError(err) => fmt::Display::fmt(err, f),
+            SendError::Io(err) => fmt::Display::fmt(err, f),
         }
     }
 }
@@ -56,7 +56,7 @@ impl Error for SendError {}
 
 impl From<IoError> for SendError {
     fn from(err: IoError) -> SendError {
-        SendError::IoError(err)
+        SendError::Io(err)
     }
 }
 
@@ -67,7 +67,7 @@ pub enum RecvError {
     IncompleteMessageRead,
     /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
     /// error.
-    IoError(IoError),
+    Io(IoError),
 }
 
 impl fmt::Display for RecvError {
@@ -76,7 +76,7 @@ impl fmt::Display for RecvError {
             RecvError::IncompleteMessageRead => {
                 write!(f, "incomplete read of WebRTC Data Channel message")
             }
-            RecvError::IoError(err) => fmt::Display::fmt(err, f),
+            RecvError::Io(err) => fmt::Display::fmt(err, f),
         }
     }
 }
@@ -85,7 +85,7 @@ impl Error for RecvError {}
 
 impl From<IoError> for RecvError {
     fn from(err: IoError) -> RecvError {
-        RecvError::IoError(err)
+        RecvError::Io(err)
     }
 }
 
