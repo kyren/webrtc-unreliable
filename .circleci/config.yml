@@ -4,14 +4,12 @@ jobs:
   build:
     docker:
       - image: circleci/rust:latest
-    environment:
-      RUST_TOOLCHAIN: nightly
     steps:
       - checkout
       - run:
           name: rustup installation
           command: |
-            rustup toolchain install nightly
+            rustup default nightly
             rustup component add rustfmt-preview
       - run:
           name: Version information
