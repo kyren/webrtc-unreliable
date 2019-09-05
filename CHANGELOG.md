@@ -1,3 +1,13 @@
+## [0.3.0]
+- Sign x509 certificates with sha256 instead of sha1
+- API changes: don't stutter with `Rtc` prefix, include more precise error types
+- Fix message type for received binary messages (thanks @slugalisk!)
+- Properly handle SCTP unreliability negotiation in init, better error logging
+  to catch protocol errors faster in the future.  Fixes major brokenness with
+  firefox (huge thanks @Healthire!)
+- Don't generate errors for what is indicative of logic bugs, simplifies error
+  API somewhat
+
 ## [0.2.1]
 - Small doc fixes
 
