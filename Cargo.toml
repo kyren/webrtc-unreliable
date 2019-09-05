@@ -23,7 +23,7 @@ futures-util = { package = "futures-util-preview", version = "0.3.0-alpha", feat
 http = "0.1.17"
 log = "0.4"
 openssl = "0.10"
-rand = "0.6"
+rand = "0.7"
 tokio-net = { version = "0.2.0-alpha", features = ["udp"] }
 tokio-timer = { version = "0.3.0-alpha", features = ["async-traits"] }
 
