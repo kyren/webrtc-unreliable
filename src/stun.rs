@@ -4,7 +4,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use crc32fast::Hasher as Crc32Hasher;
 use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer};
 
-pub type Error = Box<error::Error + Send + Sync>;
+pub type Error = Box<dyn error::Error + Send + Sync>;
 
 #[derive(Debug)]
 pub struct StunBindingRequest {

@@ -1,18 +1,18 @@
 let
   moz_overlay = import (
-    builtins.fetchTarball https://github.com/mozilla/nixpkgs-mozilla/archive/c8a2ed7e614131ea1ba3d31ef9bcc9890a0df410.tar.gz
+    builtins.fetchTarball https://github.com/mozilla/nixpkgs-mozilla/archive/ac8e9d7bbda8fb5e45cae20c5b7e44c52da3ac0c.tar.gz
   );
 
   nixpkgs = import (
-    builtins.fetchTarball https://github.com/NixOS/nixpkgs-channels/archive/796a8764ab85746f916e2cc8f6a9a5fc6d4d03ac.tar.gz
+    builtins.fetchTarball https://github.com/NixOS/nixpkgs-channels/archive/d567c486ca5ac5f0c83bb0264c325204a479a5bb.tar.gz
   ) {
     overlays = [ moz_overlay ];
   };
 in with nixpkgs;
 let
   rust_channel = rustChannelOf {
-    date = "2019-04-11";
-    channel = "stable";
+    date = "2019-09-03";
+    channel = "nightly";
   };
 
   rust = rust_channel.rust.override {

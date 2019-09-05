@@ -1,6 +1,6 @@
 [package]
 name = "webrtc-unreliable"
-version = "0.2.2-alpha.0"
+version = "0.3.0-alpha.0"
 authors = ["kyren <kerriganw@gmail.com>"]
 edition = "2018"
 description = "UDP-like (unreliable, unordered) communication between Javascript/WebAssembly and native Rust via WebRTC"
@@ -15,14 +15,21 @@ byteorder = "1.3"
 crc32c = "0.4"
 crc32fast = "1.2"
 crossbeam = "0.7"
-futures = "0.1"
+futures-channel = { package = "futures-channel-preview", version = "0.3.0-alpha", features = ["sink"] }
+futures-core = { package = "futures-core-preview", version = "0.3.0-alpha" }
+futures-sink = { package = "futures-sink-preview", version = "0.3.0-alpha" }
+# TODO: remove "nightly" feature with futures 0.3.0-alpha.19
+futures-util = { package = "futures-util-preview", version = "0.3.0-alpha", features = ["nightly", "sink", "select-macro"] }
 http = "0.1.17"
 log = "0.4"
 openssl = "0.10"
 rand = "0.6"
-tokio = "0.1"
+tokio-net = { version = "0.2.0-alpha", features = ["udp"] }
+tokio-timer = { version = "0.3.0-alpha", features = ["async-traits"] }
 
 [dev-dependencies]
-env_logger = "0.6"
-hyper = "0.12"
 clap = "2.32"
+env_logger = "0.6"
+hyper = "0.13.0-alpha"
+futures = { package = "futures-preview", version = "0.3.0-alpha" }
+tokio = "0.2.0-alpha"

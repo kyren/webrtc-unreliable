@@ -8,19 +8,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{sync::mpsc, try_ready, Async, Future, Poll, Sink, Stream};
+use futures_channel::mpsc;
+use futures_core::Stream;
+use futures_util::{pin_mut, select, FutureExt, SinkExt, StreamExt};
 use http::{header, Response};
 use log::{info, warn};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
-use tokio::{net::UdpSocket, timer::Interval};
+use tokio_net::udp::UdpSocket;
+use tokio_timer::Interval;
 
-use crate::buffer_pool::{BufferPool, PooledBuffer};
-use crate::client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE};
-use crate::crypto::Crypto;
-use crate::sdp::{gen_sdp_response, parse_sdp_fields, SdpFields};
-use crate::stun::{parse_stun_binding_request, write_stun_success_response};
-use crate::util::rand_string;
+use crate::{
+    buffer_pool::{BufferPool, PooledBuffer},
+    client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
+    crypto::Crypto,
+    sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
+    stun::{parse_stun_binding_request, write_stun_success_response},
+    util::rand_string,
+};
 
 #[derive(Debug)]
 pub enum SendError {
@@ -112,74 +117,72 @@ impl SessionEndpoint {
     /// The returned JSON object contains a digest of the x509 certificate the server will use for
     /// DTLS, and the browser will ensure that this digest matches before starting a WebRTC
     /// connection.
-    pub fn session_request<I, E, S>(
-        &self,
-        sdp_descriptor: S,
-    ) -> impl Future<Item = String, Error = BoxError>
+    pub async fn session_request<I, E, S>(&mut self, sdp_descriptor: S) -> Result<String, BoxError>
     where
         I: AsRef<[u8]>,
-        S: Stream<Item = I, Error = E>,
+        S: Stream<Item = Result<I, E>>,
         E: Error + Send + Sync + 'static,
     {
-        let this = self.clone();
-        parse_sdp_fields(sdp_descriptor)
-            .map_err(BoxError::from)
-            .and_then(move |SdpFields { ice_ufrag, mid, .. }| {
-                const SERVER_USER_LEN: usize = 12;
-                const SERVER_PASSWD_LEN: usize = 24;
+        const SERVER_USER_LEN: usize = 12;
+        const SERVER_PASSWD_LEN: usize = 24;
 
-                let mut rng = thread_rng();
-                let server_user = rand_string(&mut rng, SERVER_USER_LEN);
-                let server_passwd = rand_string(&mut rng, SERVER_PASSWD_LEN);
+        let SdpFields { ice_ufrag, mid, .. } = parse_sdp_fields(sdp_descriptor).await?;
 
-                let incoming_session = IncomingSession {
-                    server_user: server_user.clone(),
-                    server_passwd: server_passwd.clone(),
-                    remote_user: ice_ufrag,
-                };
+        let (incoming_session, response) = {
+            let mut rng = thread_rng();
+            let server_user = rand_string(&mut rng, SERVER_USER_LEN);
+            let server_passwd = rand_string(&mut rng, SERVER_PASSWD_LEN);
 
-                let response = gen_sdp_response(
-                    &mut rng,
-                    &this.cert_fingerprint,
-                    &this.public_addr.ip().to_string(),
-                    this.public_addr.ip().is_ipv6(),
-                    this.public_addr.port(),
-                    &server_user,
-                    &server_passwd,
-                    &mid,
-                );
+            let incoming_session = IncomingSession {
+                server_user: server_user.clone(),
+                server_passwd: server_passwd.clone(),
+                remote_user: ice_ufrag,
+            };
 
-                this.session_sender
-                    .send(incoming_session)
-                    .map(|_| response)
-                    .map_err(|_| "RtcSessionEndpoint disconnected from RtcServer".into())
-            })
+            let response = gen_sdp_response(
+                &mut rng,
+                &self.cert_fingerprint,
+                &self.public_addr.ip().to_string(),
+                self.public_addr.ip().is_ipv6(),
+                self.public_addr.port(),
+                &server_user,
+                &server_passwd,
+                &mid,
+            );
+
+            (incoming_session, response)
+        };
+
+        self.session_sender
+            .send(incoming_session)
+            .await
+            .map_err(|_| "RtcSessionEndpoint disconnected from RtcServer")?;
+        Ok(response)
     }
 
     /// Convenience method which returns an `http::Response` rather than a JSON string, with the
     /// correct format headers.
-    pub fn http_session_request<I, E, S>(
-        &self,
+    pub async fn http_session_request<I, E, S>(
+        &mut self,
         sdp_descriptor: S,
-    ) -> impl Future<Item = Response<String>, Error = BoxError>
+    ) -> Result<Response<String>, BoxError>
     where
         I: AsRef<[u8]>,
-        S: Stream<Item = I, Error = E>,
+        S: Stream<Item = Result<I, E>>,
         E: Error + Send + Sync + 'static,
     {
-        self.session_request(sdp_descriptor).map(|r| {
-            Response::builder()
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(r)
-                .expect("could not construct session response")
-        })
+        let r = self.session_request(sdp_descriptor).await?;
+        Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r)
+            .expect("could not construct session response"))
     }
 }
 
 pub struct Server {
     udp_socket: UdpSocket,
     session_endpoint: SessionEndpoint,
-    incoming_session_stream: Box<dyn Stream<Item = IncomingSession, Error = ()> + Send>,
+    incoming_session_stream: mpsc::Receiver<IncomingSession>,
     ssl_acceptor: SslAcceptor,
     outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
     incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, MessageType)>,
@@ -197,11 +200,11 @@ impl Server {
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
     /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
-    pub fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, IoError> {
+    pub async fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, IoError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 
         let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
-        let udp_socket = UdpSocket::bind(&listen_addr)?;
+        let udp_socket = UdpSocket::bind(&listen_addr).await?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
 
@@ -219,7 +222,7 @@ impl Server {
         Ok(Server {
             udp_socket,
             session_endpoint,
-            incoming_session_stream: Box::new(session_receiver),
+            incoming_session_stream: session_receiver,
             ssl_acceptor: crypto.ssl_acceptor,
             outgoing_udp: VecDeque::new(),
             incoming_rtc: VecDeque::new(),
@@ -271,15 +274,12 @@ impl Server {
     }
 
     /// Send the given message to the given remote client, if they are connected.
-    pub fn poll_send(
+    pub async fn send(
         &mut self,
         message: &[u8],
         message_type: MessageType,
         remote_addr: &SocketAddr,
-    ) -> Poll<(), SendError> {
-        // Send pending UDP messages before potentially buffering new ones
-        try_ready!(self.send_udp());
-
+    ) -> Result<(), SendError> {
         let client = self
             .clients
             .get_mut(remote_addr)
@@ -287,13 +287,13 @@ impl Server {
 
         match client.send_message(message_type, message) {
             Err(ClientError::NotConnected) => {
-                return Err(SendError::ClientNotConnected);
+                return Err(SendError::ClientNotConnected).into();
             }
             Err(ClientError::NotEstablished) => {
-                return Err(SendError::ClientConnectionNotEstablished);
+                return Err(SendError::ClientConnectionNotEstablished).into();
             }
             Err(ClientError::IncompletePacketWrite) => {
-                return Err(SendError::IncompleteMessageWrite)
+                return Err(SendError::IncompleteMessageWrite).into();
             }
             Err(err) => {
                 warn!(
@@ -301,25 +301,23 @@ impl Server {
                     remote_addr, err
                 );
                 let _ = client.start_shutdown();
-                return Err(SendError::ClientNotConnected);
+                return Err(SendError::ClientNotConnected).into();
             }
             Ok(()) => {}
         }
 
         self.outgoing_udp
             .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
-
-        Ok(self.send_udp()?)
+        Ok(self.send_outgoing().await?)
     }
 
     /// Receive a WebRTC data channel message from any connected client.
     ///
-    /// `poll_recv` *must* be called until it returns Async::NotReady for proper operation of the
-    /// server, as it also handles background tasks such as responding to STUN packets and timing
-    /// out existing sessions.
-    pub fn poll_recv(&mut self, buf: &mut [u8]) -> Poll<MessageResult, RecvError> {
+    /// `Server::recv` *must* be called for proper operation of the server, as it also handles
+    /// background tasks such as responding to STUN packets and timing out existing sessions.
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, RecvError> {
         while self.incoming_rtc.is_empty() {
-            try_ready!(self.process());
+            self.process().await?;
         }
 
         let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
@@ -327,142 +325,101 @@ impl Server {
         if buf.len() < message_len {
             self.incoming_rtc
                 .push_front((message, remote_addr, message_type));
-            return Err(RecvError::IncompleteMessageRead);
+            return Err(RecvError::IncompleteMessageRead).into();
         }
 
         buf[0..message_len].copy_from_slice(&message[..]);
 
-        Ok(Async::Ready(MessageResult {
+        Ok(MessageResult {
             message_len,
             message_type,
             remote_addr,
-        }))
+        })
     }
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
     // packets, receives incoming UDP packets, and responds to STUN packets.
-    fn process(&mut self) -> Poll<(), IoError> {
-        loop {
-            match self.incoming_session_stream.poll() {
-                Ok(Async::Ready(Some(incoming_session))) => {
-                    info!(
-                        "session initiated with server user: '{}' and remote user: '{}'",
-                        incoming_session.server_user, incoming_session.remote_user
-                    );
-
-                    self.sessions.insert(
-                        SessionKey {
-                            server_user: incoming_session.server_user,
-                            remote_user: incoming_session.remote_user,
-                        },
-                        Session {
-                            server_passwd: incoming_session.server_passwd,
-                            ttl: Instant::now(),
-                        },
-                    );
-                }
-                Ok(Async::Ready(None)) => panic!("connection to RtcSessionEndpoint has closed"),
-                Ok(Async::NotReady) => break,
-                Err(_) => unreachable!(),
-            }
+    async fn process(&mut self) -> Result<(), IoError> {
+        enum Next {
+            IncomingSession(IncomingSession),
+            IncomingPacket(usize, SocketAddr),
+            PeriodicTimer,
         }
 
-        if self.last_cleanup.elapsed() >= CLEANUP_INTERVAL {
-            self.last_cleanup = Instant::now();
-            self.sessions.retain(|session_key, session| {
-                if session.ttl.elapsed() < RTC_SESSION_TIMEOUT {
-                    true
-                } else {
-                    info!(
-                        "session timeout for server user '{}' and remote user '{}'",
-                        session_key.server_user, session_key.remote_user
-                    );
-                    false
-                }
-            });
-
-            self.clients.retain(|remote_addr, client| {
-                if !client.is_shutdown()
-                    && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
-                {
-                    true
-                } else {
-                    if !client.is_shutdown() {
-                        info!("connection timeout for client {}", remote_addr);
-                    }
-                    info!("client {} removed", remote_addr);
-                    false
-                }
-            });
-        }
-
-        loop {
-            match self.periodic_timer.poll() {
-                Ok(Async::Ready(val)) => {
-                    val.expect("interval stream should not stop");
-                }
-                Ok(Async::NotReady) => break,
-                Err(err) => {
-                    if err.is_shutdown() {
-                        panic!("periodic timer has unexpectedly shutdown");
-                    }
-                }
-            }
-        }
-
-        try_ready!(self.send_udp());
-        Ok(self.receive_udp()?)
-    }
-
-    // Send any currently queued UDP packets, or if there are currently none queued generate any
-    // required periodic UDP packets and send those.  Returns Async::Ready if all queued UDP packets
-    // were sent and the queue is now empty.
-    fn send_udp(&mut self) -> Poll<(), IoError> {
-        if self.outgoing_udp.is_empty() {
-            self.generate_periodic_packets();
-        }
-
-        while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
-            match self.udp_socket.poll_send_to(&packet, &remote_addr)? {
-                Async::Ready(len) => {
-                    let packet_len = packet.len();
-                    if len != packet_len {
-                        return Err(IoError::new(
-                            IoErrorKind::Other,
-                            "failed to write entire datagram to socket",
-                        ));
-                    }
-                }
-                Async::NotReady => {
-                    self.outgoing_udp.push_front((packet, remote_addr));
-                    return Ok(Async::NotReady);
-                }
-            }
-        }
-
-        Ok(Async::Ready(()))
-    }
-
-    // Handle incoming UDP packets, filling the incoming UDP queue and potentially responding to
-    // STUN requests.
-    fn receive_udp(&mut self) -> Poll<(), IoError> {
         let mut packet_buffer = self.buffer_pool.acquire();
         packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
-        let (len, remote_addr) = try_ready!(self.udp_socket.poll_recv_from(&mut packet_buffer));
-        if len > MAX_UDP_PAYLOAD_SIZE {
-            return Err(IoError::new(
-                IoErrorKind::Other,
-                "failed to read entire datagram from socket",
-            ));
-        }
-        packet_buffer.truncate(len);
+        let next = {
+            let recv_udp = self.udp_socket.recv_from(&mut packet_buffer).fuse();
+            pin_mut!(recv_udp);
 
-        if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[0..len]) {
+            let timer_next = self.periodic_timer.next().fuse();
+            pin_mut!(timer_next);
+
+            select! {
+                incoming_session = self.incoming_session_stream.next() => {
+                    Next::IncomingSession(
+                        incoming_session.expect("connection to RtcSessionEndpoint has closed")
+                    )
+                }
+                res = recv_udp => {
+                    let (len, remote_addr) = res?;
+                    Next::IncomingPacket(len, remote_addr)
+                }
+                res = timer_next => {
+                    res.expect("periodic timer should not stop");
+                    Next::PeriodicTimer
+                }
+            }
+        };
+
+        match next {
+            Next::IncomingSession(incoming_session) => self.accept_session(incoming_session),
+            Next::IncomingPacket(len, remote_addr) => {
+                if len > MAX_UDP_PAYLOAD_SIZE {
+                    return Err(IoError::new(
+                        IoErrorKind::Other,
+                        "failed to read entire datagram from socket",
+                    ));
+                }
+                packet_buffer.truncate(len);
+                self.receive_packet(remote_addr, packet_buffer);
+                self.send_outgoing().await?;
+            }
+            Next::PeriodicTimer => {
+                self.timeout_clients();
+                self.generate_periodic_packets();
+                self.send_outgoing().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Send all pending outgoing UDP packets
+    async fn send_outgoing(&mut self) -> Result<(), IoError> {
+        while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
+            let len = self.udp_socket.send_to(&packet, &remote_addr).await?;
+            let packet_len = packet.len();
+            if len != packet_len {
+                return Err(IoError::new(
+                    IoErrorKind::Other,
+                    "failed to write entire datagram to socket",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // Handle a single incoming UDP packet, either by responding to it as a STUN binding request or
+    // by handling it as part of an existing WebRTC connection.
+    fn receive_packet(&mut self, remote_addr: SocketAddr, mut packet_buffer: PooledBuffer) {
+        if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[..]) {
             if let Some(session) = self.sessions.get_mut(&SessionKey {
                 server_user: stun_binding_request.server_user,
                 remote_user: stun_binding_request.remote_user,
             }) {
                 session.ttl = Instant::now();
+                packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
                 let resp_len = write_stun_success_response(
                     stun_binding_request.transaction_id,
                     remote_addr,
@@ -507,8 +464,6 @@ impl Server {
                 );
             }
         }
-
-        Ok(Async::Ready(()))
     }
 
     // Call `RtcClient::generate_periodic` on all clients, if we are due to do so.
@@ -525,6 +480,56 @@ impl Server {
                     .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
             }
         }
+    }
+
+    // Clean up all client sessions / connections, if we are due to do so.
+    fn timeout_clients(&mut self) {
+        if self.last_cleanup.elapsed() >= CLEANUP_INTERVAL {
+            self.last_cleanup = Instant::now();
+            self.sessions.retain(|session_key, session| {
+                if session.ttl.elapsed() < RTC_SESSION_TIMEOUT {
+                    true
+                } else {
+                    info!(
+                        "session timeout for server user '{}' and remote user '{}'",
+                        session_key.server_user, session_key.remote_user
+                    );
+                    false
+                }
+            });
+
+            self.clients.retain(|remote_addr, client| {
+                if !client.is_shutdown()
+                    && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
+                {
+                    true
+                } else {
+                    if !client.is_shutdown() {
+                        info!("connection timeout for client {}", remote_addr);
+                    }
+                    info!("client {} removed", remote_addr);
+                    false
+                }
+            });
+        }
+    }
+
+    fn accept_session(&mut self, incoming_session: IncomingSession) {
+        info!(
+            "session initiated with server user: '{}' and remote user: '{}'",
+            incoming_session.server_user, incoming_session.remote_user
+        );
+
+        self.sessions.insert(
+            SessionKey {
+                server_user: incoming_session.server_user,
+                remote_user: incoming_session.remote_user,
+            },
+            Session {
+                server_passwd: incoming_session.server_passwd,
+                ttl: Instant::now(),
+            },
+        );
     }
 }
 
