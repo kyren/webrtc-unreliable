@@ -63,7 +63,7 @@ fn main() {
     let mut rtc_server = runtime
         .block_on(RtcServer::new(webrtc_listen_addr, public_webrtc_addr))
         .expect("could not start RTC server");
- 
+
     let session_endpoint = rtc_server.session_endpoint();
     let make_svc = make_service_fn(move |addr_stream: &AddrStream| {
         let session_endpoint = session_endpoint.clone();
