@@ -106,8 +106,12 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            SessionError::Disconnected => write!(f, "`SessionEndpoint` disconnected from `RtcServer`"),
-            SessionError::StreamError(e) => write!(f, "error streaming the incoming SDP descriptor: {}", e),
+            SessionError::Disconnected => {
+                write!(f, "`SessionEndpoint` disconnected from `RtcServer`")
+            }
+            SessionError::StreamError(e) => {
+                write!(f, "error streaming the incoming SDP descriptor: {}", e)
+            }
         }
     }
 }
@@ -144,7 +148,10 @@ impl SessionEndpoint {
     /// The returned JSON object contains a digest of the x509 certificate the server will use for
     /// DTLS, and the browser will ensure that this digest matches before starting a WebRTC
     /// connection.
-    pub async fn session_request<I, E, S>(&mut self, sdp_descriptor: S) -> Result<String, SessionError>
+    pub async fn session_request<I, E, S>(
+        &mut self,
+        sdp_descriptor: S,
+    ) -> Result<String, SessionError>
     where
         I: AsRef<[u8]>,
         E: Error + Send + Sync + 'static,
@@ -153,7 +160,9 @@ impl SessionEndpoint {
         const SERVER_USER_LEN: usize = 12;
         const SERVER_PASSWD_LEN: usize = 24;
 
-        let SdpFields { ice_ufrag, mid, .. } = parse_sdp_fields(sdp_descriptor).await.map_err(|e| SessionError::StreamError(e.into()))?;
+        let SdpFields { ice_ufrag, mid, .. } = parse_sdp_fields(sdp_descriptor)
+            .await
+            .map_err(|e| SessionError::StreamError(e.into()))?;
 
         let (incoming_session, response) = {
             let mut rng = thread_rng();
