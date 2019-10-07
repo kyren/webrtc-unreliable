@@ -16,8 +16,8 @@ pub struct SdpFields {
 pub async fn parse_sdp_fields<I, E, S>(body: S) -> Result<SdpFields, Error>
 where
     I: AsRef<[u8]>,
-    S: Stream<Item = Result<I, E>>,
     E: error::Error + Send + Sync + 'static,
+    S: Stream<Item = Result<I, E>>,
 {
     const MAX_SDP_LINE: usize = 512;
 

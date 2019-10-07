@@ -94,6 +94,33 @@ impl From<IoError> for RecvError {
     }
 }
 
+#[derive(Debug)]
+pub enum SessionError {
+    /// `SessionEndpoint` has beeen disconnected from its `RtcServer` (the `RtcServer` has been
+    /// dropped).
+    Disconnected,
+    /// An error streaming the SDP descriptor
+    StreamError(Box<dyn Error + Send + Sync + 'static>),
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            SessionError::Disconnected => write!(f, "`SessionEndpoint` disconnected from `RtcServer`"),
+            SessionError::StreamError(e) => write!(f, "error streaming the incoming SDP descriptor: {}", e),
+        }
+    }
+}
+
+impl Error for SessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            SessionError::Disconnected => None,
+            SessionError::StreamError(e) => Some(e.as_ref()),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct MessageResult {
     pub message_len: usize,
@@ -117,16 +144,16 @@ impl SessionEndpoint {
     /// The returned JSON object contains a digest of the x509 certificate the server will use for
     /// DTLS, and the browser will ensure that this digest matches before starting a WebRTC
     /// connection.
-    pub async fn session_request<I, E, S>(&mut self, sdp_descriptor: S) -> Result<String, BoxError>
+    pub async fn session_request<I, E, S>(&mut self, sdp_descriptor: S) -> Result<String, SessionError>
     where
         I: AsRef<[u8]>,
-        S: Stream<Item = Result<I, E>>,
         E: Error + Send + Sync + 'static,
+        S: Stream<Item = Result<I, E>>,
     {
         const SERVER_USER_LEN: usize = 12;
         const SERVER_PASSWD_LEN: usize = 24;
 
-        let SdpFields { ice_ufrag, mid, .. } = parse_sdp_fields(sdp_descriptor).await?;
+        let SdpFields { ice_ufrag, mid, .. } = parse_sdp_fields(sdp_descriptor).await.map_err(|e| SessionError::StreamError(e.into()))?;
 
         let (incoming_session, response) = {
             let mut rng = thread_rng();
@@ -156,7 +183,7 @@ impl SessionEndpoint {
         self.session_sender
             .send(incoming_session)
             .await
-            .map_err(|_| "RtcSessionEndpoint disconnected from RtcServer")?;
+            .map_err(|_| SessionError::Disconnected)?;
         Ok(response)
     }
 
@@ -165,11 +192,11 @@ impl SessionEndpoint {
     pub async fn http_session_request<I, E, S>(
         &mut self,
         sdp_descriptor: S,
-    ) -> Result<Response<String>, BoxError>
+    ) -> Result<Response<String>, SessionError>
     where
         I: AsRef<[u8]>,
-        S: Stream<Item = Result<I, E>>,
         E: Error + Send + Sync + 'static,
+        S: Stream<Item = Result<I, E>>,
     {
         let r = self.session_request(sdp_descriptor).await?;
         Ok(Response::builder()
@@ -538,8 +565,6 @@ const RTC_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const PERIODIC_PACKET_INTERVAL: Duration = Duration::from_secs(1);
 const PERIODIC_TIMER_INTERVAL: Duration = Duration::from_secs(1);
-
-type BoxError = Box<dyn Error + Send + Sync>;
 
 #[derive(Eq, PartialEq, Hash, Clone, Debug)]
 struct SessionKey {
