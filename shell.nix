@@ -24,5 +24,6 @@ in
       pkg-config
       openssl
       rust
+      cargo-release
     ];
   }
