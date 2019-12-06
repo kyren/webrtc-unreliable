@@ -15,8 +15,8 @@ use http::{header, Response};
 use log::{info, warn};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
-use tokio_net::udp::UdpSocket;
-use tokio_timer::Interval;
+use tokio::net::UdpSocket;
+use tokio::time::{self, Interval};
 
 use crate::{
     buffer_pool::{BufferPool, PooledBuffer},
@@ -267,7 +267,7 @@ impl Server {
             clients: HashMap::new(),
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
-            periodic_timer: Interval::new_interval(PERIODIC_TIMER_INTERVAL),
+            periodic_timer: time::interval(PERIODIC_TIMER_INTERVAL),
         })
     }
 
@@ -388,7 +388,7 @@ impl Server {
             let recv_udp = self.udp_socket.recv_from(&mut packet_buffer).fuse();
             pin_mut!(recv_udp);
 
-            let timer_next = self.periodic_timer.next().fuse();
+            let timer_next = self.periodic_timer.tick().fuse();
             pin_mut!(timer_next);
 
             select! {
@@ -401,8 +401,7 @@ impl Server {
                     let (len, remote_addr) = res?;
                     Next::IncomingPacket(len, remote_addr)
                 }
-                res = timer_next => {
-                    res.expect("periodic timer should not stop");
+                _ = timer_next => {
                     Next::PeriodicTimer
                 }
             }

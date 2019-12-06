@@ -1,3 +1,7 @@
+## [0.4.0]
+- API incompatible change: depend on futures 0.3, tokio 0.2, and refactor API to
+  use stable async / await.
+
 ## [0.3.0]
 - Sign x509 certificates with sha256 instead of sha1
 - API changes: don't stutter with `Rtc` prefix, include more precise error types

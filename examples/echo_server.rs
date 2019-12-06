@@ -6,11 +6,11 @@ use hyper::{
     Body, Error, Method, Response, Server, StatusCode,
 };
 use log::{info, warn};
-use tokio::runtime::Runtime;
 
 use webrtc_unreliable::Server as RtcServer;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let matches = App::new("echo_server")
@@ -40,8 +40,6 @@ fn main() {
         )
         .get_matches();
 
-    let runtime = Runtime::new().expect("could not build tokio runtime");
-
     let webrtc_listen_addr = matches
         .value_of("data")
         .unwrap()
@@ -60,9 +58,9 @@ fn main() {
         .parse()
         .expect("could not parse HTTP address/port");
 
-    let mut rtc_server = runtime
-        .block_on(RtcServer::new(webrtc_listen_addr, public_webrtc_addr))
-        .expect("could not start RTC server");
+    let mut rtc_server = tokio::spawn(
+        RtcServer::new(webrtc_listen_addr, public_webrtc_addr)).await
+        .unwrap().expect("could not start RTC server");
 
     let session_endpoint = rtc_server.session_endpoint();
     let make_svc = make_service_fn(move |addr_stream: &AddrStream| {
@@ -102,7 +100,7 @@ fn main() {
         }
     });
 
-    runtime.spawn(async move {
+    tokio::spawn(async move {
         Server::bind(&session_listen_addr)
             .serve(make_svc)
             .await
@@ -110,7 +108,7 @@ fn main() {
     });
 
     let mut message_buf = vec![0; 0x10000];
-    runtime.spawn(async move {
+    tokio::spawn(async move {
         loop {
             match rtc_server.recv(&mut message_buf).await {
                 Ok(received) => {
@@ -131,7 +129,5 @@ fn main() {
                 Err(err) => warn!("could not receive RTC message: {}", err),
             }
         }
-    });
-
-    runtime.shutdown_on_idle();
+    }).await.unwrap();
 }

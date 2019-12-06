@@ -11,8 +11,7 @@ let
 in with nixpkgs;
 let
   rust_channel = rustChannelOf {
-    date = "2019-09-03";
-    channel = "nightly";
+    channel = "1.39.0";
   };
 
   rust = rust_channel.rust.override {
@@ -25,5 +24,6 @@ in
       openssl
       rust
       cargo-release
+      cargo-outdated
     ];
   }
