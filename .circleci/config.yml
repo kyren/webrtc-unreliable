@@ -7,10 +7,9 @@ jobs:
     steps:
       - checkout
       - run:
-          name: rustup installation
+          name: Setup Rust
           command: |
-            rustup default nightly
-            rustup component add rustfmt-preview
+            rustup component add rustfmt
       - run:
           name: Version information
           command: |
