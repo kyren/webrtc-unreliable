@@ -58,9 +58,8 @@ async fn main() {
         .parse()
         .expect("could not parse HTTP address/port");
 
-    let mut rtc_server = tokio::spawn(RtcServer::new(webrtc_listen_addr, public_webrtc_addr))
+    let mut rtc_server = RtcServer::new(webrtc_listen_addr, public_webrtc_addr)
         .await
-        .unwrap()
         .expect("could not start RTC server");
 
     let session_endpoint = rtc_server.session_endpoint();
