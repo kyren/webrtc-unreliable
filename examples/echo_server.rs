@@ -108,28 +108,24 @@ async fn main() {
     });
 
     let mut message_buf = vec![0; 0x10000];
-    tokio::spawn(async move {
-        loop {
-            match rtc_server.recv(&mut message_buf).await {
-                Ok(received) => {
-                    if let Err(err) = rtc_server
-                        .send(
-                            &message_buf[0..received.message_len],
-                            received.message_type,
-                            &received.remote_addr,
-                        )
-                        .await
-                    {
-                        warn!(
-                            "could not send message to {}: {}",
-                            received.remote_addr, err
-                        )
-                    }
+    loop {
+        match rtc_server.recv(&mut message_buf).await {
+            Ok(received) => {
+                if let Err(err) = rtc_server
+                    .send(
+                        &message_buf[0..received.message_len],
+                        received.message_type,
+                        &received.remote_addr,
+                    )
+                    .await
+                {
+                    warn!(
+                        "could not send message to {}: {}",
+                        received.remote_addr, err
+                    )
                 }
-                Err(err) => warn!("could not receive RTC message: {}", err),
             }
+            Err(err) => warn!("could not receive RTC message: {}", err),
         }
-    })
-    .await
-    .unwrap();
+    }
 }
