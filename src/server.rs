@@ -96,8 +96,7 @@ impl From<IoError> for RecvError {
 
 #[derive(Debug)]
 pub enum SessionError {
-    /// `SessionEndpoint` has beeen disconnected from its `RtcServer` (the `RtcServer` has been
-    /// dropped).
+    /// `SessionEndpoint` has beeen disconnected from its `Server` (the `Server` has been dropped).
     Disconnected,
     /// An error streaming the SDP descriptor
     StreamError(Box<dyn Error + Send + Sync + 'static>),
@@ -107,7 +106,7 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
             SessionError::Disconnected => {
-                write!(f, "`SessionEndpoint` disconnected from `RtcServer`")
+                write!(f, "`SessionEndpoint` disconnected from `Server`")
             }
             SessionError::StreamError(e) => {
                 write!(f, "error streaming the incoming SDP descriptor: {}", e)
@@ -274,12 +273,12 @@ impl Server {
     /// Returns a `SessionEndpoint` which can be used to start new WebRTC sessions.
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
-    /// the returned `RtcSessionEndpoint`, and this communication channel will be used to exchange
+    /// the returned `SessionEndpoint`, and this communication channel will be used to exchange
     /// session descriptions in SDP format.
     ///
-    /// The returned `RtcSessionEndpoint` will notify this `RtcServer` of new sessions via a shared
-    /// async channel.  This is done so that the `RtcSessionEndpoint` is easy to use in a separate
-    /// server task (such as a `hyper` HTTP server).
+    /// The returned `SessionEndpoint` will notify this `Server` of new sessions via a shared async
+    /// channel.  This is done so that the `SessionEndpoint` is easy to use in a separate server
+    /// task (such as a `hyper` HTTP server).
     pub fn session_endpoint(&self) -> SessionEndpoint {
         self.session_endpoint.clone()
     }
@@ -394,7 +393,7 @@ impl Server {
             select! {
                 incoming_session = self.incoming_session_stream.next() => {
                     Next::IncomingSession(
-                        incoming_session.expect("connection to RtcSessionEndpoint has closed")
+                        incoming_session.expect("connection to SessionEndpoint has closed")
                     )
                 }
                 res = recv_udp => {
@@ -501,7 +500,7 @@ impl Server {
         }
     }
 
-    // Call `RtcClient::generate_periodic` on all clients, if we are due to do so.
+    // Call `Client::generate_periodic` on all clients, if we are due to do so.
     fn generate_periodic_packets(&mut self) {
         if self.last_generate_periodic.elapsed() >= PERIODIC_PACKET_INTERVAL {
             self.last_generate_periodic = Instant::now();
