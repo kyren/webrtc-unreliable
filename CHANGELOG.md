@@ -1,3 +1,7 @@
+## [0.4.1]
+- Remove crossbeam dependency, use a new buffer pooling strategy that should be
+  much faster
+
 ## [0.4.0]
 - API incompatible change: depend on futures 0.3, tokio 0.2, and refactor API to
   use stable async / await.
