@@ -1,52 +1,79 @@
 use std::{
-    mem,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
-use crossbeam::queue::SegQueue;
-
-/// Sharable pool of Vec<u8> buffers where buffers are returned to the pool on drop.
+/// Shared pool of reusable Vec<u8> buffers.
+///
+/// Send and lock-free, but will panic if accessed from multiple threads at one time.
 #[derive(Clone, Debug)]
-pub struct BufferPool(Arc<Pool>);
+pub struct BufferPool(Arc<Mutex<Vec<OwnedBuffer>>>);
 
 impl BufferPool {
     pub fn new() -> BufferPool {
-        BufferPool(Arc::new(Pool::new()))
+        BufferPool(Arc::new(Mutex::new(Vec::new())))
     }
 
-    /// Acquire a buffer from the pool, or construct a new one if one is not available.  Returned
-    /// buffers always have len == 0, but will have the capacity from their previous use.
-    pub fn acquire(&self) -> PooledBuffer {
-        let mut buffer = self.0.pop().ok().unwrap_or_default();
-        buffer.clear();
-        PooledBuffer(buffer, self.0.clone())
+    /// Acquire a buffer from the pool and return a handle to it, the buffer is guaranteed to have
+    /// length zero.
+    ///
+    /// The buffer will be returned to the pool when the handle is dropped, unless it is converted
+    /// to an `OwnedBuffer`.
+    pub fn acquire(&self) -> BufferHandle {
+        let mut buffer = self.0.try_lock().unwrap().pop().unwrap_or_default();
+        buffer.0.clear();
+        BufferHandle(self, Some(buffer))
+    }
+
+    /// Adopt an owned buffer, returning a handle that will return the owned buffer to the pool on
+    /// drop.
+    pub fn adopt(&self, buffer: OwnedBuffer) -> BufferHandle {
+        BufferHandle(self, Some(buffer))
+    }
+
+    fn release(&self, buffer: OwnedBuffer) {
+        self.0.try_lock().unwrap().push(buffer);
     }
 }
 
-/// A wrapper around a pooled Vec<u8> buffer.  On drop, the buffer is returned to its source pool
-/// *without* its capacity being changed.
-#[derive(Debug)]
-pub struct PooledBuffer(Vec<u8>, Arc<Pool>);
+/// A handle to a pooled buffer which will return the buffer to the pool on drop.
+pub struct BufferHandle<'a>(&'a BufferPool, Option<OwnedBuffer>);
 
-impl Deref for PooledBuffer {
+impl<'a> BufferHandle<'a> {
+    /// Convert this buffer handle into an `OwnedBuffer`, which does not borrow the `BufferPool` and
+    /// will not automatically return the buffer to the pool on drop.
+    pub fn into_owned(mut self) -> OwnedBuffer {
+        self.1.take().unwrap()
+    }
+}
+
+impl<'a> Deref for BufferHandle<'a> {
     type Target = Vec<u8>;
 
     fn deref(&self) -> &Vec<u8> {
-        &self.0
+        &self.1.as_ref().unwrap().0
     }
 }
 
-impl DerefMut for PooledBuffer {
+impl<'a> DerefMut for BufferHandle<'a> {
     fn deref_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.0
+        &mut self.1.as_mut().unwrap().0
     }
 }
 
-impl Drop for PooledBuffer {
+impl<'a> Drop for BufferHandle<'a> {
     fn drop(&mut self) {
-        self.1.push(mem::replace(&mut self.0, Vec::new()));
+        if let Some(owned) = self.1.take() {
+            self.0.release(owned);
+        }
     }
 }
 
-type Pool = SegQueue<Vec<u8>>;
+/// An buffer that has been taken out of a `BufferPool` and is no longer owned by it.
+///
+/// It is an opaque type for transferring ownership of buffers, in order to access the inner buffer
+/// it must first be returned to the pool.  By preventing the use of the buffer without returning
+/// ownership to the pool first, this wrapper type makes it less likely that owned buffers will be
+/// dropped without being returned to the pool.
+#[derive(Debug, Default)]
+pub struct OwnedBuffer(Vec<u8>);

@@ -19,7 +19,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{self, Interval};
 
 use crate::{
-    buffer_pool::{BufferPool, PooledBuffer},
+    buffer_pool::{BufferPool, OwnedBuffer},
     client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
@@ -105,9 +105,7 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            SessionError::Disconnected => {
-                write!(f, "`SessionEndpoint` disconnected from `Server`")
-            }
+            SessionError::Disconnected => write!(f, "`SessionEndpoint` disconnected from `Server`"),
             SessionError::StreamError(e) => {
                 write!(f, "error streaming the incoming SDP descriptor: {}", e)
             }
@@ -219,8 +217,8 @@ pub struct Server {
     session_endpoint: SessionEndpoint,
     incoming_session_stream: mpsc::Receiver<IncomingSession>,
     ssl_acceptor: SslAcceptor,
-    outgoing_udp: VecDeque<(PooledBuffer, SocketAddr)>,
-    incoming_rtc: VecDeque<(PooledBuffer, SocketAddr, MessageType)>,
+    outgoing_udp: VecDeque<(OwnedBuffer, SocketAddr)>,
+    incoming_rtc: VecDeque<(OwnedBuffer, SocketAddr, MessageType)>,
     buffer_pool: BufferPool,
     sessions: HashMap<SessionKey, Session>,
     clients: HashMap<SocketAddr, Client>,
@@ -356,10 +354,11 @@ impl Server {
         }
 
         let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
+        let message = self.buffer_pool.adopt(message);
         let message_len = message.len();
         if buf.len() < message_len {
             self.incoming_rtc
-                .push_front((message, remote_addr, message_type));
+                .push_front((message.into_owned(), remote_addr, message_type));
             return Err(RecvError::IncompleteMessageRead).into();
         }
 
@@ -407,7 +406,10 @@ impl Server {
         };
 
         match next {
-            Next::IncomingSession(incoming_session) => self.accept_session(incoming_session),
+            Next::IncomingSession(incoming_session) => {
+                drop(packet_buffer);
+                self.accept_session(incoming_session)
+            }
             Next::IncomingPacket(len, remote_addr) => {
                 if len > MAX_UDP_PAYLOAD_SIZE {
                     return Err(IoError::new(
@@ -416,10 +418,12 @@ impl Server {
                     ));
                 }
                 packet_buffer.truncate(len);
+                let packet_buffer = packet_buffer.into_owned();
                 self.receive_packet(remote_addr, packet_buffer);
                 self.send_outgoing().await?;
             }
             Next::PeriodicTimer => {
+                drop(packet_buffer);
                 self.timeout_clients();
                 self.generate_periodic_packets();
                 self.send_outgoing().await?;
@@ -432,6 +436,7 @@ impl Server {
     // Send all pending outgoing UDP packets
     async fn send_outgoing(&mut self) -> Result<(), IoError> {
         while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
+            let packet = self.buffer_pool.adopt(packet);
             let len = self.udp_socket.send_to(&packet, &remote_addr).await?;
             let packet_len = packet.len();
             if len != packet_len {
@@ -446,7 +451,8 @@ impl Server {
 
     // Handle a single incoming UDP packet, either by responding to it as a STUN binding request or
     // by handling it as part of an existing WebRTC connection.
-    fn receive_packet(&mut self, remote_addr: SocketAddr, mut packet_buffer: PooledBuffer) {
+    fn receive_packet(&mut self, remote_addr: SocketAddr, packet_buffer: OwnedBuffer) {
+        let mut packet_buffer = self.buffer_pool.adopt(packet_buffer);
         if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[..]) {
             if let Some(session) = self.sessions.get_mut(&SessionKey {
                 server_user: stun_binding_request.server_user,
@@ -463,7 +469,8 @@ impl Server {
                 .expect("could not write stun response");
 
                 packet_buffer.truncate(resp_len);
-                self.outgoing_udp.push_back((packet_buffer, remote_addr));
+                self.outgoing_udp
+                    .push_back((packet_buffer.into_owned(), remote_addr));
 
                 match self.clients.entry(remote_addr) {
                     HashMapEntry::Vacant(vacant) => {
@@ -482,7 +489,7 @@ impl Server {
             }
         } else {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
-                if let Err(err) = client.receive_incoming_packet(packet_buffer) {
+                if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned()) {
                     warn!(
                         "client {} had unexpected error receiving UDP packet, shutting down: {}",
                         remote_addr, err
