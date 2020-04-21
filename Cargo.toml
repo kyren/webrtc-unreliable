@@ -13,7 +13,6 @@ license = "MIT"
 [dependencies]
 byteorder = "1.3"
 crc = "1.8.1"
-crc32fast = "1.2"
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-sink = { version = "0.3" }
