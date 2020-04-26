@@ -66,6 +66,35 @@ impl From<IoError> for SendError {
 }
 
 #[derive(Debug)]
+pub enum RecvError {
+    /// Non-fatal error reading a WebRTC Data Channel message that is too large to fit in the
+    /// provided buffer and has thus been truncated.
+    IncompleteMessageRead(MessageResult),
+    /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
+    /// error.
+    Io(IoError),
+}
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            RecvError::IncompleteMessageRead(_) => {
+                write!(f, "incomplete read of WebRTC Data Channel message")
+            }
+            RecvError::Io(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for RecvError {}
+
+impl From<IoError> for RecvError {
+    fn from(err: IoError) -> RecvError {
+        RecvError::Io(err)
+    }
+}
+
+#[derive(Debug)]
 pub enum SessionError {
     /// `SessionEndpoint` has beeen disconnected from its `Server` (the `Server` has been dropped).
     Disconnected,
@@ -95,8 +124,7 @@ impl Error for SessionError {
 
 #[derive(Copy, Clone, Debug)]
 pub struct MessageResult {
-    /// The number of bytes in the received message.  May be *larger* than the size of the provided
-    /// read buffer, in which case the read message will be truncated.
+    /// The number of bytes in the received message.
     pub message_len: usize,
     pub message_type: MessageType,
     pub remote_addr: SocketAddr,
@@ -327,7 +355,7 @@ impl Server {
     /// If the provided buffer is not large enough to hold the received message, the received
     /// message will be truncated, and the original length will be returned as part of
     /// `MessageResult`.
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, IoError> {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, RecvError> {
         while self.incoming_rtc.is_empty() {
             self.process().await?;
         }
@@ -339,11 +367,17 @@ impl Server {
         let copy_len = message_len.min(buf.len());
         buf[..copy_len].copy_from_slice(&message[..copy_len]);
 
-        Ok(MessageResult {
+        let result = MessageResult {
             message_len,
             message_type,
             remote_addr,
-        })
+        };
+
+        if copy_len < message_len {
+            Err(RecvError::IncompleteMessageRead(result))
+        } else {
+            Ok(result)
+        }
     }
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
