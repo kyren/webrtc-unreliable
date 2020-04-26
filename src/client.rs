@@ -22,17 +22,32 @@ use rand::{thread_rng, Rng};
 use crate::buffer_pool::{BufferPool, OwnedBuffer};
 use crate::sctp::{
     read_sctp_packet, write_sctp_packet, SctpChunk, SctpPacket, SctpWriteError,
-    SCTP_FLAG_COMPLETE_UNRELIABLE,
+    SCTP_FLAG_BEGIN_FRAGMENT, SCTP_FLAG_COMPLETE_UNRELIABLE, SCTP_FLAG_END_FRAGMENT,
 };
 
 /// Heartbeat packets will be generated at a maximum of this rate (if the connection is otherwise
 /// idle).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
-// TODO: I'm not sure whether this is correct
+// Maximum theoretical UDP payload size
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 65507;
+
+// Derived through experimentation, any larger and openssl reports 'dtls message too big'.
 pub const MAX_DTLS_MESSAGE_SIZE: usize = 16384;
+
 pub const MAX_SCTP_PACKET_SIZE: usize = MAX_DTLS_MESSAGE_SIZE;
+
+// The overhead of sending a single SCTP packet with a single data message.
+pub const SCTP_MESSAGE_OVERHEAD: usize = 28;
+
+/// Maximum supported theoretical size of a single WebRTC message, based on DTLS and SCTP packet
+/// size limits.
+///
+/// WebRTC makes no attempt at packet fragmentation and re-assembly or to support fragmented
+/// received messages, all sent and received unreliable messages must fit into a single SCTP packet.
+/// As such, this maximum size is almost certainly too large for browsers to actually support.
+/// Start with a much lower MTU (around 1200) and test it.
+pub const MAX_MESSAGE_LEN: usize = MAX_SCTP_PACKET_SIZE - SCTP_MESSAGE_OVERHEAD;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -156,7 +171,15 @@ impl Client {
         Ok(())
     }
 
-    /// Connection has either timed out or finished shutting down
+    /// Returns true if the shutdown process has been started or has already finished.
+    pub fn shutdown_started(&self) -> bool {
+        match &self.ssl_state {
+            ClientSslState::ShuttingDown(_) | ClientSslState::Shutdown => true,
+            _ => false,
+        }
+    }
+
+    /// Connection has either timed out or finished shutting down.
     pub fn is_shutdown(&self) -> bool {
         match &self.ssl_state {
             ClientSslState::Shutdown => true,
@@ -565,71 +588,77 @@ fn receive_sctp_packet(
                 }
             }
             SctpChunk::Data {
-                chunk_flags: _,
+                chunk_flags,
                 tsn,
                 stream_id,
                 stream_seq: _,
                 proto_id,
                 user_data,
             } => {
-                client_state.sctp_remote_tsn = max_tsn(client_state.sctp_remote_tsn, tsn);
+                if chunk_flags & SCTP_FLAG_BEGIN_FRAGMENT == 0
+                    || chunk_flags & SCTP_FLAG_END_FRAGMENT == 0
+                {
+                    debug!("received fragmented SCTP packet, dropping");
+                } else {
+                    client_state.sctp_remote_tsn = max_tsn(client_state.sctp_remote_tsn, tsn);
 
-                if proto_id == DATA_CHANNEL_PROTO_CONTROL {
-                    if !user_data.is_empty() {
-                        if user_data[0] == DATA_CHANNEL_MESSAGE_OPEN {
-                            send_sctp_packet(
-                                &buffer_pool,
-                                ssl_stream,
-                                SctpPacket {
-                                    source_port: client_state.sctp_local_port,
-                                    dest_port: client_state.sctp_remote_port,
-                                    verification_tag: client_state.sctp_remote_verification_tag,
-                                    chunks: &[SctpChunk::Data {
-                                        chunk_flags: SCTP_FLAG_COMPLETE_UNRELIABLE,
-                                        tsn: client_state.sctp_local_tsn,
-                                        stream_id,
-                                        stream_seq: 0,
-                                        proto_id: DATA_CHANNEL_PROTO_CONTROL,
-                                        user_data: &[DATA_CHANNEL_MESSAGE_ACK],
-                                    }],
-                                },
-                            )?;
-                            client_state.sctp_local_tsn =
-                                client_state.sctp_local_tsn.wrapping_add(1);
+                    if proto_id == DATA_CHANNEL_PROTO_CONTROL {
+                        if !user_data.is_empty() {
+                            if user_data[0] == DATA_CHANNEL_MESSAGE_OPEN {
+                                send_sctp_packet(
+                                    &buffer_pool,
+                                    ssl_stream,
+                                    SctpPacket {
+                                        source_port: client_state.sctp_local_port,
+                                        dest_port: client_state.sctp_remote_port,
+                                        verification_tag: client_state.sctp_remote_verification_tag,
+                                        chunks: &[SctpChunk::Data {
+                                            chunk_flags: SCTP_FLAG_COMPLETE_UNRELIABLE,
+                                            tsn: client_state.sctp_local_tsn,
+                                            stream_id,
+                                            stream_seq: 0,
+                                            proto_id: DATA_CHANNEL_PROTO_CONTROL,
+                                            user_data: &[DATA_CHANNEL_MESSAGE_ACK],
+                                        }],
+                                    },
+                                )?;
+                                client_state.sctp_local_tsn =
+                                    client_state.sctp_local_tsn.wrapping_add(1);
+                            }
                         }
+                    } else if proto_id == DATA_CHANNEL_PROTO_STRING {
+                        let mut msg_buffer = buffer_pool.acquire();
+                        msg_buffer.extend(user_data);
+                        client_state
+                            .received_messages
+                            .push((MessageType::Text, msg_buffer.into_owned()));
+                    } else if proto_id == DATA_CHANNEL_PROTO_BINARY {
+                        let mut msg_buffer = buffer_pool.acquire();
+                        msg_buffer.extend(user_data);
+                        client_state
+                            .received_messages
+                            .push((MessageType::Binary, msg_buffer.into_owned()));
                     }
-                } else if proto_id == DATA_CHANNEL_PROTO_STRING {
-                    let mut msg_buffer = buffer_pool.acquire();
-                    msg_buffer.extend(user_data);
-                    client_state
-                        .received_messages
-                        .push((MessageType::Text, msg_buffer.into_owned()));
-                } else if proto_id == DATA_CHANNEL_PROTO_BINARY {
-                    let mut msg_buffer = buffer_pool.acquire();
-                    msg_buffer.extend(user_data);
-                    client_state
-                        .received_messages
-                        .push((MessageType::Binary, msg_buffer.into_owned()));
+
+                    send_sctp_packet(
+                        &buffer_pool,
+                        ssl_stream,
+                        SctpPacket {
+                            source_port: client_state.sctp_local_port,
+                            dest_port: client_state.sctp_remote_port,
+                            verification_tag: client_state.sctp_remote_verification_tag,
+                            chunks: &[SctpChunk::SAck {
+                                cumulative_tsn_ack: client_state.sctp_remote_tsn,
+                                adv_recv_window: SCTP_BUFFER_SIZE,
+                                num_gap_ack_blocks: 0,
+                                num_dup_tsn: 0,
+                            }],
+                        },
+                    )?;
+
+                    client_state.last_activity = Instant::now();
+                    client_state.last_sent = Instant::now();
                 }
-
-                send_sctp_packet(
-                    &buffer_pool,
-                    ssl_stream,
-                    SctpPacket {
-                        source_port: client_state.sctp_local_port,
-                        dest_port: client_state.sctp_remote_port,
-                        verification_tag: client_state.sctp_remote_verification_tag,
-                        chunks: &[SctpChunk::SAck {
-                            cumulative_tsn_ack: client_state.sctp_remote_tsn,
-                            adv_recv_window: SCTP_BUFFER_SIZE,
-                            num_gap_ack_blocks: 0,
-                            num_dup_tsn: 0,
-                        }],
-                    },
-                )?;
-
-                client_state.last_activity = Instant::now();
-                client_state.last_sent = Instant::now();
             }
             SctpChunk::Heartbeat { heartbeat_info } => {
                 send_sctp_packet(

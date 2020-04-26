@@ -35,7 +35,7 @@ pub enum SendError {
     /// established yet or is currently shutting down.
     ClientConnectionNotEstablished,
     /// Non-fatal error writing a WebRTC Data Channel message that is too large to fit in the
-    /// maximum message size.
+    /// maximum message length.
     IncompleteMessageWrite,
     /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
     /// error.
@@ -62,35 +62,6 @@ impl Error for SendError {}
 impl From<IoError> for SendError {
     fn from(err: IoError) -> SendError {
         SendError::Io(err)
-    }
-}
-
-#[derive(Debug)]
-pub enum RecvError {
-    /// Non-fatal error reading a WebRTC Data Channel message that is too large to fit in the
-    /// provided buffer.
-    IncompleteMessageRead,
-    /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
-    /// error.
-    Io(IoError),
-}
-
-impl fmt::Display for RecvError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        match self {
-            RecvError::IncompleteMessageRead => {
-                write!(f, "incomplete read of WebRTC Data Channel message")
-            }
-            RecvError::Io(err) => fmt::Display::fmt(err, f),
-        }
-    }
-}
-
-impl Error for RecvError {}
-
-impl From<IoError> for RecvError {
-    fn from(err: IoError) -> RecvError {
-        RecvError::Io(err)
     }
 }
 
@@ -124,6 +95,8 @@ impl Error for SessionError {
 
 #[derive(Copy, Clone, Debug)]
 pub struct MessageResult {
+    /// The number of bytes in the received message.  May be *larger* than the size of the provided
+    /// read buffer, in which case the read message will be truncated.
     pub message_len: usize,
     pub message_type: MessageType,
     pub remote_addr: SocketAddr,
@@ -307,6 +280,8 @@ impl Server {
     }
 
     /// Send the given message to the given remote client, if they are connected.
+    ///
+    /// The given message must be less than `MAX_MESSAGE_LEN`.
     pub async fn send(
         &mut self,
         message: &[u8],
@@ -348,7 +323,11 @@ impl Server {
     ///
     /// `Server::recv` *must* be called for proper operation of the server, as it also handles
     /// background tasks such as responding to STUN packets and timing out existing sessions.
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, RecvError> {
+    ///
+    /// If the provided buffer is not large enough to hold the received message, the received
+    /// message will be truncated, and the original length will be returned as part of
+    /// `MessageResult`.
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, IoError> {
         while self.incoming_rtc.is_empty() {
             self.process().await?;
         }
@@ -356,13 +335,9 @@ impl Server {
         let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
         let message = self.buffer_pool.adopt(message);
         let message_len = message.len();
-        if buf.len() < message_len {
-            self.incoming_rtc
-                .push_front((message.into_owned(), remote_addr, message_type));
-            return Err(RecvError::IncompleteMessageRead).into();
-        }
 
-        buf[0..message_len].copy_from_slice(&message[..]);
+        let copy_len = message_len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&message[..copy_len]);
 
         Ok(MessageResult {
             message_len,
@@ -490,11 +465,13 @@ impl Server {
         } else {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
                 if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned()) {
-                    warn!(
-                        "client {} had unexpected error receiving UDP packet, shutting down: {}",
-                        remote_addr, err
-                    );
-                    let _ = client.start_shutdown();
+                    if !client.shutdown_started() {
+                        warn!(
+                            "client {} had unexpected error receiving UDP packet, shutting down: {}",
+                            remote_addr, err
+                        );
+                        let _ = client.start_shutdown();
+                    }
                 }
                 self.outgoing_udp
                     .extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
@@ -514,8 +491,10 @@ impl Server {
 
             for (remote_addr, client) in &mut self.clients {
                 if let Err(err) = client.generate_periodic() {
-                    warn!("error for client {}, shutting down: {}", remote_addr, err);
-                    let _ = client.start_shutdown();
+                    if !client.shutdown_started() {
+                        warn!("error for client {}, shutting down: {}", remote_addr, err);
+                        let _ = client.start_shutdown();
+                    }
                 }
                 self.outgoing_udp
                     .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));

@@ -7,11 +7,11 @@ use hyper::{
 };
 use log::{info, warn};
 
-use webrtc_unreliable::Server as RtcServer;
+use webrtc_unreliable::{Server as RtcServer, MAX_MESSAGE_LEN};
 
 #[tokio::main]
 async fn main() {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
 
     let matches = App::new("echo_server")
         .arg(
@@ -107,7 +107,7 @@ async fn main() {
             .expect("HTTP session server has died");
     });
 
-    let mut message_buf = vec![0; 0x10000];
+    let mut message_buf = vec![0; MAX_MESSAGE_LEN];
     loop {
         match rtc_server.recv(&mut message_buf).await {
             Ok(received) => {
