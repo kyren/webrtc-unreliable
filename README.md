@@ -34,9 +34,9 @@ than 1200 bytes.
 
 ## Credit
 
-This was originally a sort of Rust / tokio port of the
-[WebUDP](https://github.com/seemk/WebUdp) project, so a lot of the credit for
-the original design goes there.
+This was originally a Rust / Tokio port of the
+[WebUDP](https://github.com/seemk/WebUdp) project, so the credit for the
+original design goes there.
 
 ## License
 
