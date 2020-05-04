@@ -360,30 +360,28 @@ impl Server {
     /// If the provided buffer is not large enough to hold the received message, the received
     /// message will be truncated, and the original length will be returned as part of
     /// `MessageResult`.
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<Option<MessageResult>, RecvError> {
-        if self.incoming_rtc.is_empty() {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, RecvError> {
+        while self.incoming_rtc.is_empty() {
             self.process().await?;
-            return Ok(None);
         }
-        else {
-            let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
-            let message = self.buffer_pool.adopt(message);
-            let message_len = message.len();
 
-            let copy_len = message_len.min(buf.len());
-            buf[..copy_len].copy_from_slice(&message[..copy_len]);
+        let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
+        let message = self.buffer_pool.adopt(message);
+        let message_len = message.len();
 
-            let result = MessageResult {
-                message_len,
-                message_type,
-                remote_addr,
-            };
+        let copy_len = message_len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&message[..copy_len]);
 
-            if copy_len < message_len {
-                return Err(RecvError::IncompleteMessageRead(result));
-            } else {
-                return Ok(Some(result));
-            }
+        let result = MessageResult {
+            message_len,
+            message_type,
+            remote_addr,
+        };
+
+        if copy_len < message_len {
+            Err(RecvError::IncompleteMessageRead(result))
+        } else {
+            Ok(result)
         }
     }
 
