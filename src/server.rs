@@ -20,7 +20,7 @@ use tokio::time::{self, Interval};
 
 use crate::{
     buffer_pool::{BufferPool, OwnedBuffer},
-    client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
+    client::{Client, ClientError, EventContainer, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
     stun::{parse_stun_binding_request, write_stun_success_response},
@@ -226,6 +226,7 @@ pub struct Server {
     last_generate_periodic: Instant,
     last_cleanup: Instant,
     periodic_timer: Interval,
+    event_container: EventContainer
 }
 
 impl Server {
@@ -266,6 +267,10 @@ impl Server {
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
             periodic_timer: time::interval(PERIODIC_TIMER_INTERVAL),
+            event_container: EventContainer {
+                connect_function: None,
+                disconnect_function: None
+            }
         })
     }
 
@@ -498,7 +503,7 @@ impl Server {
             }
         } else {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
-                if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned()) {
+                if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned(), &self.event_container) {
                     if !client.shutdown_started() {
                         warn!(
                             "client {} had unexpected error receiving UDP packet, shutting down: {}",
@@ -552,6 +557,7 @@ impl Server {
                 }
             });
 
+            let event_container = &self.event_container;
             self.clients.retain(|remote_addr, client| {
                 if !client.is_shutdown()
                     && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
@@ -562,6 +568,7 @@ impl Server {
                         info!("connection timeout for client {}", remote_addr);
                     }
                     info!("client {} removed", remote_addr);
+                    (event_container.disconnect_function.as_ref().unwrap())(*remote_addr);
                     false
                 }
             });
@@ -584,6 +591,14 @@ impl Server {
                 ttl: Instant::now(),
             },
         );
+    }
+
+    pub fn on_connection(&mut self, func: impl Fn(SocketAddr) + Sync + Send + 'static) {
+        self.event_container.connect_function = Some(Box::new(func));
+    }
+
+    pub fn on_disconnection(&mut self, func: impl Fn(SocketAddr) + Sync + Send + 'static) {
+        self.event_container.disconnect_function = Some(Box::new(func));
     }
 }
 

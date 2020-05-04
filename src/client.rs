@@ -217,13 +217,14 @@ impl Client {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer) -> Result<(), ClientError> {
+    pub fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_container: &EventContainer) -> Result<(), ClientError> {
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Handshake(mut mid_handshake) => {
                 mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
                 match mid_handshake.handshake() {
                     Ok(ssl_stream) => {
                         info!("DTLS handshake finished for remote {}", self.remote_addr);
+                        (event_container.connect_function.as_ref().unwrap())(self.remote_addr);
                         ClientSslState::Established(ssl_stream)
                     }
                     Err(handshake_error) => match handshake_error {
@@ -734,4 +735,9 @@ fn receive_sctp_packet(
     }
 
     Ok(true)
+}
+
+pub struct EventContainer {
+    pub connect_function: Option<Box<dyn Fn(SocketAddr) + Sync + Send>>,
+    pub disconnect_function: Option<Box<dyn Fn(SocketAddr) + Sync + Send>>,
 }
