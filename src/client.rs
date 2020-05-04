@@ -18,6 +18,8 @@ use openssl::{
     },
 };
 use rand::{thread_rng, Rng};
+use futures_channel::mpsc;
+use futures_util::{SinkExt};
 
 use crate::buffer_pool::{BufferPool, OwnedBuffer};
 use crate::sctp::{
@@ -217,13 +219,21 @@ impl Client {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer) -> Result<(), ClientError> {
+    pub async fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_sender: &mut Option<mpsc::Sender<ClientEvent>>) -> Result<(), ClientError> {
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Handshake(mut mid_handshake) => {
                 mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
                 match mid_handshake.handshake() {
                     Ok(ssl_stream) => {
                         info!("DTLS handshake finished for remote {}", self.remote_addr);
+                        if event_sender.is_some() {
+                            if let Err(err) = event_sender.as_mut().unwrap().send(ClientEvent::Connection(self.remote_addr)).await {
+                                warn!(
+                                    "Sending connection event for {} failed: {}",
+                                    self.remote_addr, err
+                                );
+                            }
+                        }
                         ClientSslState::Established(ssl_stream)
                     }
                     Err(handshake_error) => match handshake_error {
@@ -734,4 +744,9 @@ fn receive_sctp_packet(
     }
 
     Ok(true)
+}
+
+pub enum ClientEvent {
+    Connection(SocketAddr),
+    Disconnection(SocketAddr),
 }

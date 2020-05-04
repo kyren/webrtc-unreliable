@@ -20,7 +20,7 @@ use tokio::time::{self, Interval};
 
 use crate::{
     buffer_pool::{BufferPool, OwnedBuffer},
-    client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
+    client::{Client, ClientError, ClientEvent, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
     stun::{parse_stun_binding_request, write_stun_success_response},
@@ -226,6 +226,7 @@ pub struct Server {
     last_generate_periodic: Instant,
     last_cleanup: Instant,
     periodic_timer: Interval,
+    event_sender: Option<mpsc::Sender<ClientEvent>>,
 }
 
 impl Server {
@@ -241,6 +242,7 @@ impl Server {
         let udp_socket = UdpSocket::bind(&listen_addr).await?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
+
 
         info!(
             "new WebRTC data channel server listening on {}, public addr {}",
@@ -266,6 +268,7 @@ impl Server {
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
             periodic_timer: time::interval(PERIODIC_TIMER_INTERVAL),
+            event_sender: None,
         })
     }
 
@@ -428,12 +431,12 @@ impl Server {
                 }
                 packet_buffer.truncate(len);
                 let packet_buffer = packet_buffer.into_owned();
-                self.receive_packet(remote_addr, packet_buffer);
+                self.receive_packet(remote_addr, packet_buffer).await?;
                 self.send_outgoing().await?;
             }
             Next::PeriodicTimer => {
                 drop(packet_buffer);
-                self.timeout_clients();
+                self.timeout_clients().await?;
                 self.generate_periodic_packets();
                 self.send_outgoing().await?;
             }
@@ -460,7 +463,7 @@ impl Server {
 
     // Handle a single incoming UDP packet, either by responding to it as a STUN binding request or
     // by handling it as part of an existing WebRTC connection.
-    fn receive_packet(&mut self, remote_addr: SocketAddr, packet_buffer: OwnedBuffer) {
+    async fn receive_packet(&mut self, remote_addr: SocketAddr, packet_buffer: OwnedBuffer) -> Result<(), IoError> {
         let mut packet_buffer = self.buffer_pool.adopt(packet_buffer);
         if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[..]) {
             if let Some(session) = self.sessions.get_mut(&SessionKey {
@@ -498,7 +501,8 @@ impl Server {
             }
         } else {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
-                if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned()) {
+                if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned(),
+                                                                 &mut self.event_sender).await {
                     if !client.shutdown_started() {
                         warn!(
                             "client {} had unexpected error receiving UDP packet, shutting down: {}",
@@ -516,6 +520,8 @@ impl Server {
                 );
             }
         }
+
+        Ok(())
     }
 
     // Call `Client::generate_periodic` on all clients, if we are due to do so.
@@ -537,7 +543,7 @@ impl Server {
     }
 
     // Clean up all client sessions / connections, if we are due to do so.
-    fn timeout_clients(&mut self) {
+    async fn timeout_clients(&mut self) -> Result<(), IoError> {
         if self.last_cleanup.elapsed() >= CLEANUP_INTERVAL {
             self.last_cleanup = Instant::now();
             self.sessions.retain(|session_key, session| {
@@ -552,20 +558,38 @@ impl Server {
                 }
             });
 
-            self.clients.retain(|remote_addr, client| {
-                if !client.is_shutdown()
-                    && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
-                {
-                    true
-                } else {
-                    if !client.is_shutdown() {
-                        info!("connection timeout for client {}", remote_addr);
+            for (address, client) in &self.clients {
+                match client_should_shutdown(client) {
+                    ShutdownAction::None => {}
+                    ShutdownAction::Shutdown | ShutdownAction::TimeoutAndShutdown => {
+                        if self.event_sender.is_some() {
+                            if let Err(err) = self.event_sender.as_mut().unwrap().send(ClientEvent::Disconnection(*address)).await {
+                                warn!(
+                                    "Sending disconnection event for {} failed: {}",
+                                    address, err
+                                );
+                            }
+                        }
                     }
-                    info!("client {} removed", remote_addr);
-                    false
+                }
+            }
+            self.clients.retain(|remote_addr, client| {
+                match client_should_shutdown(client) {
+                    ShutdownAction::None => true,
+                    ShutdownAction::TimeoutAndShutdown => {
+                        info!("connection timeout for client {}", remote_addr);
+                        info!("client {} removed", remote_addr);
+                        false
+                    }
+                    ShutdownAction::Shutdown => {
+                        info!("client {} removed", remote_addr);
+                        false
+                    }
                 }
             });
         }
+
+        Ok(())
     }
 
     fn accept_session(&mut self, incoming_session: IncomingSession) {
@@ -584,6 +608,41 @@ impl Server {
                 ttl: Instant::now(),
             },
         );
+    }
+
+    pub fn get_event_receiver(&mut self) -> Option<mpsc::Receiver<ClientEvent>> {
+        if self.event_sender.is_some() {
+            // get_event_receiver() can only be called ONCE
+            // if self.event_sender already exists, that means get_event_receiver() has already
+            // been called, therefore, return nothing
+            return None;
+        }
+
+        const EVENT_BUFFER_SIZE: usize = 8;
+
+        let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
+
+        self.event_sender = Some(event_sender);
+
+        return Some(event_receiver);
+    }
+}
+
+enum ShutdownAction {
+    None,
+    Shutdown,
+    TimeoutAndShutdown
+}
+
+fn client_should_shutdown(client: &Client) -> ShutdownAction {
+    if !client.is_shutdown() && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
+    {
+        return ShutdownAction::None;
+    } else {
+        if !client.is_shutdown() {
+            return ShutdownAction::TimeoutAndShutdown;
+        }
+        return ShutdownAction::Shutdown;
     }
 }
 
