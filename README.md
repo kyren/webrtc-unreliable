@@ -32,6 +32,18 @@ simply dropped on read.  The maximum message length depends on the particular
 browser you connect with, but in my testing currently it is slightly smaller
 than 1200 bytes.
 
+## Running the example
+
+In a terminal: 
+
+```
+$cargo run --example echo_server -- --data 127.0.0.1:42424 --http 127.0.0.1:8080 --public 127.0.0.1:42424
+```
+
+Then, using a web browser, go to 'http://127.0.0.1:8080/index.html'. Open the debug console, if everything is working correctly you should see messages being sent and received.
+
+Please note that if you are using Firefox, Firefox does not accept WebRTC connections to 127.0.0.1, so you may need to use a different IP address.
+
 ## Credit
 
 This was originally a Rust / Tokio port of the
