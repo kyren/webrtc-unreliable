@@ -18,6 +18,8 @@ use openssl::{
     },
 };
 use rand::{thread_rng, Rng};
+use futures_channel::mpsc;
+use futures_util::{SinkExt};
 
 use crate::buffer_pool::{BufferPool, OwnedBuffer};
 use crate::sctp::{
@@ -57,6 +59,7 @@ pub enum ClientError {
     NotEstablished,
     IncompletePacketRead,
     IncompletePacketWrite,
+    SendEventFailure,
 }
 
 impl fmt::Display for ClientError {
@@ -73,6 +76,9 @@ impl fmt::Display for ClientError {
             }
             ClientError::IncompletePacketWrite => {
                 write!(f, "WebRTC connection packet not completely written")
+            }
+            ClientError::SendEventFailure => {
+                write!(f, "Event channel send failed")
             }
         }
     }
@@ -217,14 +223,14 @@ impl Client {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_container: &EventContainer) -> Result<(), ClientError> {
+    pub async fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_sender: &mut EventSender) -> Result<(), ClientError> {
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Handshake(mut mid_handshake) => {
                 mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
                 match mid_handshake.handshake() {
                     Ok(ssl_stream) => {
                         info!("DTLS handshake finished for remote {}", self.remote_addr);
-                        (event_container.connect_function.as_ref().unwrap())(self.remote_addr);
+                        event_sender.send(ClientEvent::Connection(self.remote_addr)).await?;
                         ClientSslState::Established(ssl_stream)
                     }
                     Err(handshake_error) => match handshake_error {
@@ -737,7 +743,25 @@ fn receive_sctp_packet(
     Ok(true)
 }
 
-pub struct EventContainer {
-    pub connect_function: Option<Box<dyn Fn(SocketAddr) + Sync + Send>>,
-    pub disconnect_function: Option<Box<dyn Fn(SocketAddr) + Sync + Send>>,
+pub enum ClientEvent {
+    Connection(SocketAddr),
+    Disconnection(SocketAddr),
+}
+
+#[derive(Clone)]
+pub struct EventSender {
+    pub internal: mpsc::Sender<ClientEvent>,
+}
+
+impl EventSender {
+
+    pub async fn send(&mut self, client_event: ClientEvent) -> Result<(), ClientError> {
+
+        self.internal
+            .send(client_event)
+            .await
+            .map_err(|_| ClientError::SendEventFailure)?;
+
+        Ok(())
+    }
 }
