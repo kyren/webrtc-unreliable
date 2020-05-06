@@ -32,6 +32,12 @@ simply dropped on read.  The maximum message length depends on the particular
 browser you connect with, but in my testing currently it is slightly smaller
 than 1200 bytes.
 
+## Running the example
+
+```
+cargo run --example echo_server -- --data 127.0.0.1:42424 --http 127.0.0.1:42425 --public 127.0.0.1:42424
+```
+
 ## Credit
 
 This was originally a Rust / Tokio port of the
