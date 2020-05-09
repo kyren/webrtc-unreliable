@@ -26,7 +26,6 @@ use crate::sctp::{
     read_sctp_packet, write_sctp_packet, SctpChunk, SctpPacket, SctpWriteError,
     SCTP_FLAG_BEGIN_FRAGMENT, SCTP_FLAG_COMPLETE_UNRELIABLE, SCTP_FLAG_END_FRAGMENT,
 };
-use std::borrow::BorrowMut;
 
 /// Heartbeat packets will be generated at a maximum of this rate (if the connection is otherwise
 /// idle).
