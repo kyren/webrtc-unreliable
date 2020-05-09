@@ -26,6 +26,7 @@ use crate::sctp::{
     read_sctp_packet, write_sctp_packet, SctpChunk, SctpPacket, SctpWriteError,
     SCTP_FLAG_BEGIN_FRAGMENT, SCTP_FLAG_COMPLETE_UNRELIABLE, SCTP_FLAG_END_FRAGMENT,
 };
+use std::borrow::BorrowMut;
 
 /// Heartbeat packets will be generated at a maximum of this rate (if the connection is otherwise
 /// idle).
@@ -223,14 +224,16 @@ impl Client {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub async fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_sender: &mut EventSender) -> Result<(), ClientError> {
+    pub async fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_sender: &mut Option<EventSender>) -> Result<(), ClientError> {
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Handshake(mut mid_handshake) => {
                 mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
                 match mid_handshake.handshake() {
                     Ok(ssl_stream) => {
                         info!("DTLS handshake finished for remote {}", self.remote_addr);
-                        event_sender.send(ClientEvent::Connection(self.remote_addr)).await?;
+                        if event_sender.is_some() {
+                            event_sender.as_mut().unwrap().send(ClientEvent::Connection(self.remote_addr)).await?;
+                        }
                         ClientSslState::Established(ssl_stream)
                     }
                     Err(handshake_error) => match handshake_error {

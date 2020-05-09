@@ -226,7 +226,7 @@ pub struct Server {
     last_generate_periodic: Instant,
     last_cleanup: Instant,
     periodic_timer: Interval,
-    event_sender: EventSender,
+    event_sender: Option<EventSender>,
 }
 
 impl Server {
@@ -235,15 +235,14 @@ impl Server {
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
     /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
-    pub async fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<(Server, mpsc::Receiver<ClientEvent>), IoError> {
+    pub async fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, IoError> {
         const SESSION_BUFFER_SIZE: usize = 10;
-        const EVENT_BUFFER_SIZE: usize = 10;
 
         let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
         let udp_socket = UdpSocket::bind(&listen_addr).await?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
-        let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
+
 
         info!(
             "new WebRTC data channel server listening on {}, public addr {}",
@@ -256,11 +255,7 @@ impl Server {
             session_sender,
         };
 
-        let event_sender_container = EventSender {
-            internal: event_sender,
-        };
-
-        Ok((Server {
+        Ok(Server {
             udp_socket,
             session_endpoint,
             incoming_session_stream: session_receiver,
@@ -273,9 +268,8 @@ impl Server {
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
             periodic_timer: time::interval(PERIODIC_TIMER_INTERVAL),
-            event_sender: event_sender_container,
-        },
-            event_receiver))
+            event_sender: None,
+        })
     }
 
     /// Returns a `SessionEndpoint` which can be used to start new WebRTC sessions.
@@ -568,11 +562,13 @@ impl Server {
                 match client_should_shutdown(client) {
                     ShutdownAction::None => {}
                     ShutdownAction::Shutdown | ShutdownAction::TimeoutAndShutdown => {
-                        if let Err(err) = self.event_sender.send(ClientEvent::Disconnection(*address)).await {
-                            warn!(
-                                "Disconnection event for {} failed: {}",
-                                address, err
-                            );
+                        if self.event_sender.is_some() {
+                            if let Err(err) = self.event_sender.as_mut().unwrap().send(ClientEvent::Disconnection(*address)).await {
+                                warn!(
+                                    "Disconnection event for {} failed: {}",
+                                    address, err
+                                );
+                            }
                         }
                     }
                 }
@@ -613,6 +609,25 @@ impl Server {
             },
         );
     }
+
+    pub fn get_event_receiver(&mut self) -> Option<mpsc::Receiver<ClientEvent>> {
+        if self.event_sender.is_some() {
+            // get_event_receiver() can only be called ONCE
+            // if self.event_sender already exists, that means get_event_receiver() has already
+            // been called, therefore, return nothing
+            return None;
+        }
+
+        const EVENT_BUFFER_SIZE: usize = 10;
+
+        let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
+
+        self.event_sender = Some(EventSender {
+            internal: event_sender,
+        });
+
+        return Some(event_receiver);
+    }
 }
 
 enum ShutdownAction {
@@ -620,6 +635,7 @@ enum ShutdownAction {
     Shutdown,
     TimeoutAndShutdown
 }
+
 fn client_should_shutdown(client: &Client) -> ShutdownAction {
     if !client.is_shutdown() && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
     {
