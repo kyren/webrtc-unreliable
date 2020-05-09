@@ -504,8 +504,10 @@ impl Server {
             }
         } else {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
-                if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned(),
-                                                                 &mut self.event_sender).await {
+                if let Err(err) = client
+                    .receive_incoming_packet(packet_buffer.into_owned(), &mut self.event_sender)
+                    .await
+                {
                     if !client.shutdown_started() {
                         warn!(
                             "client {} had unexpected error receiving UDP packet, shutting down: {}",
@@ -566,11 +568,13 @@ impl Server {
                     ShutdownAction::None => {}
                     ShutdownAction::Shutdown | ShutdownAction::TimeoutAndShutdown => {
                         if self.event_sender.is_some() {
-                            if let Err(err) = self.event_sender
+                            if let Err(err) = self
+                                .event_sender
                                 .as_mut()
                                 .unwrap()
                                 .send(ClientEvent::Disconnection(*address))
-                                .await {
+                                .await
+                            {
                                 warn!(
                                     "Sending disconnection event for {} failed: {}",
                                     address, err

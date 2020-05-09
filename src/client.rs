@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_channel::mpsc;
+use futures_util::SinkExt;
 use log::{debug, info, warn};
 use openssl::{
     error::ErrorStack as OpenSslErrorStack,
@@ -18,8 +20,6 @@ use openssl::{
     },
 };
 use rand::{thread_rng, Rng};
-use futures_channel::mpsc;
-use futures_util::{SinkExt};
 
 use crate::buffer_pool::{BufferPool, OwnedBuffer};
 use crate::sctp::{
@@ -219,9 +219,10 @@ impl Client {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub async fn receive_incoming_packet(&mut self,
-                                         udp_packet: OwnedBuffer,
-                                         event_sender: &mut Option<mpsc::Sender<ClientEvent>>
+    pub async fn receive_incoming_packet(
+        &mut self,
+        udp_packet: OwnedBuffer,
+        event_sender: &mut Option<mpsc::Sender<ClientEvent>>,
     ) -> Result<(), ClientError> {
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Handshake(mut mid_handshake) => {
