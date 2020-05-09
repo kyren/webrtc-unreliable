@@ -20,7 +20,7 @@ use tokio::time::{self, Interval};
 
 use crate::{
     buffer_pool::{BufferPool, OwnedBuffer},
-    client::{Client, ClientError, ClientEvent, EventSender, MessageType, MAX_UDP_PAYLOAD_SIZE},
+    client::{Client, ClientError, ClientEvent, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
     stun::{parse_stun_binding_request, write_stun_success_response},
@@ -226,7 +226,7 @@ pub struct Server {
     last_generate_periodic: Instant,
     last_cleanup: Instant,
     periodic_timer: Interval,
-    event_sender: Option<EventSender>,
+    event_sender: Option<mpsc::Sender<ClientEvent>>,
 }
 
 impl Server {
@@ -565,7 +565,7 @@ impl Server {
                         if self.event_sender.is_some() {
                             if let Err(err) = self.event_sender.as_mut().unwrap().send(ClientEvent::Disconnection(*address)).await {
                                 warn!(
-                                    "Disconnection event for {} failed: {}",
+                                    "Sending disconnection event for {} failed: {}",
                                     address, err
                                 );
                             }
@@ -622,9 +622,7 @@ impl Server {
 
         let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
 
-        self.event_sender = Some(EventSender {
-            internal: event_sender,
-        });
+        self.event_sender = Some(event_sender);
 
         return Some(event_receiver);
     }

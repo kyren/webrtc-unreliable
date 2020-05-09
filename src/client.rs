@@ -59,7 +59,6 @@ pub enum ClientError {
     NotEstablished,
     IncompletePacketRead,
     IncompletePacketWrite,
-    SendEventFailure,
 }
 
 impl fmt::Display for ClientError {
@@ -76,9 +75,6 @@ impl fmt::Display for ClientError {
             }
             ClientError::IncompletePacketWrite => {
                 write!(f, "WebRTC connection packet not completely written")
-            }
-            ClientError::SendEventFailure => {
-                write!(f, "Event channel send failed")
             }
         }
     }
@@ -223,7 +219,7 @@ impl Client {
 
     /// Pushes an available UDP packet.  Will error if called when the client is currently in the
     /// shutdown state.
-    pub async fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_sender: &mut Option<EventSender>) -> Result<(), ClientError> {
+    pub async fn receive_incoming_packet(&mut self, udp_packet: OwnedBuffer, event_sender: &mut Option<mpsc::Sender<ClientEvent>>) -> Result<(), ClientError> {
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Handshake(mut mid_handshake) => {
                 mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
@@ -231,7 +227,12 @@ impl Client {
                     Ok(ssl_stream) => {
                         info!("DTLS handshake finished for remote {}", self.remote_addr);
                         if event_sender.is_some() {
-                            event_sender.as_mut().unwrap().send(ClientEvent::Connection(self.remote_addr)).await?;
+                            if let Err(err) = event_sender.as_mut().unwrap().send(ClientEvent::Connection(self.remote_addr)).await {
+                                warn!(
+                                    "Sending connection event for {} failed: {}",
+                                    self.remote_addr, err
+                                );
+                            }
                         }
                         ClientSslState::Established(ssl_stream)
                     }
@@ -748,22 +749,4 @@ fn receive_sctp_packet(
 pub enum ClientEvent {
     Connection(SocketAddr),
     Disconnection(SocketAddr),
-}
-
-#[derive(Clone)]
-pub struct EventSender {
-    pub internal: mpsc::Sender<ClientEvent>,
-}
-
-impl EventSender {
-
-    pub async fn send(&mut self, client_event: ClientEvent) -> Result<(), ClientError> {
-
-        self.internal
-            .send(client_event)
-            .await
-            .map_err(|_| ClientError::SendEventFailure)?;
-
-        Ok(())
-    }
 }
