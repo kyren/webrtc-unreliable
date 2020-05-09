@@ -236,7 +236,7 @@ impl Server {
     /// WebRTC connections must be started via an external communication channel from a browser via
     /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
     pub async fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, IoError> {
-        const SESSION_BUFFER_SIZE: usize = 10;
+        const SESSION_BUFFER_SIZE: usize = 8;
 
         let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
         let udp_socket = UdpSocket::bind(&listen_addr).await?;
@@ -618,7 +618,7 @@ impl Server {
             return None;
         }
 
-        const EVENT_BUFFER_SIZE: usize = 10;
+        const EVENT_BUFFER_SIZE: usize = 8;
 
         let (event_sender, event_receiver) = mpsc::channel(EVENT_BUFFER_SIZE);
 
