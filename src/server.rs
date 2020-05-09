@@ -462,7 +462,11 @@ impl Server {
 
     // Handle a single incoming UDP packet, either by responding to it as a STUN binding request or
     // by handling it as part of an existing WebRTC connection.
-    async fn receive_packet(&mut self, remote_addr: SocketAddr, packet_buffer: OwnedBuffer) -> Result<(), IoError> {
+    async fn receive_packet(
+        &mut self,
+        remote_addr: SocketAddr,
+        packet_buffer: OwnedBuffer,
+    ) -> Result<(), IoError> {
         let mut packet_buffer = self.buffer_pool.adopt(packet_buffer);
         if let Some(stun_binding_request) = parse_stun_binding_request(&packet_buffer[..]) {
             if let Some(session) = self.sessions.get_mut(&SessionKey {
@@ -562,7 +566,11 @@ impl Server {
                     ShutdownAction::None => {}
                     ShutdownAction::Shutdown | ShutdownAction::TimeoutAndShutdown => {
                         if self.event_sender.is_some() {
-                            if let Err(err) = self.event_sender.as_mut().unwrap().send(ClientEvent::Disconnection(*address)).await {
+                            if let Err(err) = self.event_sender
+                                .as_mut()
+                                .unwrap()
+                                .send(ClientEvent::Disconnection(*address))
+                                .await {
                                 warn!(
                                     "Sending disconnection event for {} failed: {}",
                                     address, err
@@ -573,8 +581,8 @@ impl Server {
                 }
             }
 
-            self.clients.retain(|remote_addr, client| {
-                match client_should_shutdown(client) {
+            self.clients
+                .retain(|remote_addr, client| match client_should_shutdown(client) {
                     ShutdownAction::None => true,
                     ShutdownAction::TimeoutAndShutdown => {
                         info!("connection timeout for client {}", remote_addr);
@@ -585,8 +593,7 @@ impl Server {
                         info!("client {} removed", remote_addr);
                         false
                     }
-                }
-            });
+                });
         }
 
         Ok(())
@@ -631,12 +638,11 @@ impl Server {
 enum ShutdownAction {
     None,
     Shutdown,
-    TimeoutAndShutdown
+    TimeoutAndShutdown,
 }
 
 fn client_should_shutdown(client: &Client) -> ShutdownAction {
-    if !client.is_shutdown() && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
-    {
+    if !client.is_shutdown() && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT {
         return ShutdownAction::None;
     } else {
         if !client.is_shutdown() {
