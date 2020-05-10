@@ -8,4 +8,4 @@ mod stun;
 mod util;
 
 pub use client::{MessageType, MAX_MESSAGE_LEN};
-pub use server::{MessageResult, MessageBuffer, SendError, Server, SessionEndpoint};
+pub use server::{MessageBuffer, MessageResult, SendError, Server, SessionEndpoint};

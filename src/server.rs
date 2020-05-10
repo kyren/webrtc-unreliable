@@ -5,9 +5,9 @@ use std::{
     fmt,
     io::{Error as IoError, ErrorKind as IoErrorKind},
     net::SocketAddr,
+    ops::Deref,
     sync::Arc,
     time::{Duration, Instant},
-    ops::Deref,
 };
 
 use futures_channel::mpsc;
@@ -20,7 +20,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{self, Interval};
 
 use crate::{
-    buffer_pool::{BufferPool, OwnedBuffer, BufferHandle},
+    buffer_pool::{BufferHandle, BufferPool, OwnedBuffer},
     client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},

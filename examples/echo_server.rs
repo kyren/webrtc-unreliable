@@ -6,7 +6,7 @@ use hyper::{
     Body, Error, Method, Response, Server, StatusCode,
 };
 
-use webrtc_unreliable::{Server as RtcServer};
+use webrtc_unreliable::Server as RtcServer;
 
 #[tokio::main]
 async fn main() {
