@@ -1,25 +1,26 @@
 use std::{
     collections::{hash_map::Entry as HashMapEntry, HashMap, VecDeque},
+    convert::AsRef,
     error::Error,
     fmt,
     io::{Error as IoError, ErrorKind as IoErrorKind},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
+    ops::Deref,
 };
 
 use futures_channel::mpsc;
 use futures_core::Stream;
 use futures_util::{pin_mut, select, FutureExt, SinkExt, StreamExt};
 use http::{header, Response};
-use log::{info, warn};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
 use tokio::net::UdpSocket;
 use tokio::time::{self, Interval};
 
 use crate::{
-    buffer_pool::{BufferPool, OwnedBuffer},
+    buffer_pool::{BufferPool, OwnedBuffer, BufferHandle},
     client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
@@ -66,35 +67,6 @@ impl From<IoError> for SendError {
 }
 
 #[derive(Debug)]
-pub enum RecvError {
-    /// Non-fatal error reading a WebRTC Data Channel message that is too large to fit in the
-    /// provided buffer and has thus been truncated.
-    IncompleteMessageRead(MessageResult),
-    /// I/O error on the underlying socket.  May or may not be fatal, depending on the specific
-    /// error.
-    Io(IoError),
-}
-
-impl fmt::Display for RecvError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        match self {
-            RecvError::IncompleteMessageRead(_) => {
-                write!(f, "incomplete read of WebRTC Data Channel message")
-            }
-            RecvError::Io(err) => fmt::Display::fmt(err, f),
-        }
-    }
-}
-
-impl Error for RecvError {}
-
-impl From<IoError> for RecvError {
-    fn from(err: IoError) -> RecvError {
-        RecvError::Io(err)
-    }
-}
-
-#[derive(Debug)]
 pub enum SessionError {
     /// `SessionEndpoint` has beeen disconnected from its `Server` (the `Server` has been dropped).
     Disconnected,
@@ -122,10 +94,25 @@ impl Error for SessionError {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct MessageResult {
-    /// The number of bytes in the received message.
-    pub message_len: usize,
+/// A reference to an internal buffer containing a received message.
+pub struct MessageBuffer<'a>(BufferHandle<'a>);
+
+impl<'a> Deref for MessageBuffer<'a> {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl<'a> AsRef<[u8]> for MessageBuffer<'a> {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub struct MessageResult<'a> {
+    pub message: MessageBuffer<'a>,
     pub message_type: MessageType,
     pub remote_addr: SocketAddr,
 }
@@ -242,9 +229,10 @@ impl Server {
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
 
-        info!(
+        log::info!(
             "new WebRTC data channel server listening on {}, public addr {}",
-            listen_addr, public_addr
+            listen_addr,
+            public_addr
         );
 
         let session_endpoint = SessionEndpoint {
@@ -297,12 +285,13 @@ impl Server {
     pub fn disconnect(&mut self, remote_addr: &SocketAddr) {
         if let Some(client) = self.clients.get_mut(remote_addr) {
             if let Err(err) = client.start_shutdown() {
-                warn!(
+                log::warn!(
                     "error starting shutdown for client {}: {}",
-                    remote_addr, err
+                    remote_addr,
+                    err
                 );
             } else {
-                info!("starting shutdown for client {}", remote_addr);
+                log::info!("starting shutdown for client {}", remote_addr);
             }
         }
     }
@@ -332,9 +321,10 @@ impl Server {
                 return Err(SendError::IncompleteMessageWrite).into();
             }
             Err(err) => {
-                warn!(
+                log::warn!(
                     "message send for client {} generated unexpected error, shutting down: {}",
-                    remote_addr, err
+                    remote_addr,
+                    err
                 );
                 let _ = client.start_shutdown();
                 return Err(SendError::ClientNotConnected).into();
@@ -355,29 +345,18 @@ impl Server {
     /// If the provided buffer is not large enough to hold the received message, the received
     /// message will be truncated, and the original length will be returned as part of
     /// `MessageResult`.
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<MessageResult, RecvError> {
+    pub async fn recv(&mut self) -> Result<MessageResult<'_>, IoError> {
         while self.incoming_rtc.is_empty() {
             self.process().await?;
         }
 
         let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
-        let message = self.buffer_pool.adopt(message);
-        let message_len = message.len();
-
-        let copy_len = message_len.min(buf.len());
-        buf[..copy_len].copy_from_slice(&message[..copy_len]);
-
-        let result = MessageResult {
-            message_len,
+        let message = MessageBuffer(self.buffer_pool.adopt(message));
+        return Ok(MessageResult {
+            message,
             message_type,
             remote_addr,
-        };
-
-        if copy_len < message_len {
-            Err(RecvError::IncompleteMessageRead(result))
-        } else {
-            Ok(result)
-        }
+        });
     }
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
@@ -483,7 +462,7 @@ impl Server {
 
                 match self.clients.entry(remote_addr) {
                     HashMapEntry::Vacant(vacant) => {
-                        info!(
+                        log::info!(
                             "beginning client data channel connection with {}",
                             remote_addr,
                         );
@@ -500,7 +479,7 @@ impl Server {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
                 if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned()) {
                     if !client.shutdown_started() {
-                        warn!(
+                        log::warn!(
                             "client {} had unexpected error receiving UDP packet, shutting down: {}",
                             remote_addr, err
                         );
@@ -526,7 +505,7 @@ impl Server {
             for (remote_addr, client) in &mut self.clients {
                 if let Err(err) = client.generate_periodic() {
                     if !client.shutdown_started() {
-                        warn!("error for client {}, shutting down: {}", remote_addr, err);
+                        log::warn!("error for client {}, shutting down: {}", remote_addr, err);
                         let _ = client.start_shutdown();
                     }
                 }
@@ -544,9 +523,10 @@ impl Server {
                 if session.ttl.elapsed() < RTC_SESSION_TIMEOUT {
                     true
                 } else {
-                    info!(
+                    log::info!(
                         "session timeout for server user '{}' and remote user '{}'",
-                        session_key.server_user, session_key.remote_user
+                        session_key.server_user,
+                        session_key.remote_user
                     );
                     false
                 }
@@ -559,9 +539,9 @@ impl Server {
                     true
                 } else {
                     if !client.is_shutdown() {
-                        info!("connection timeout for client {}", remote_addr);
+                        log::info!("connection timeout for client {}", remote_addr);
                     }
-                    info!("client {} removed", remote_addr);
+                    log::info!("client {} removed", remote_addr);
                     false
                 }
             });
@@ -569,9 +549,10 @@ impl Server {
     }
 
     fn accept_session(&mut self, incoming_session: IncomingSession) {
-        info!(
+        log::info!(
             "session initiated with server user: '{}' and remote user: '{}'",
-            incoming_session.server_user, incoming_session.remote_user
+            incoming_session.server_user,
+            incoming_session.remote_user
         );
 
         self.sessions.insert(

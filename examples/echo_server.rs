@@ -5,9 +5,8 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Error, Method, Response, Server, StatusCode,
 };
-use log::{info, warn};
 
-use webrtc_unreliable::{Server as RtcServer, MAX_MESSAGE_LEN};
+use webrtc_unreliable::{Server as RtcServer};
 
 #[tokio::main]
 async fn main() {
@@ -73,11 +72,11 @@ async fn main() {
                     if req.uri().path() == "/"
                         || req.uri().path() == "/index.html" && req.method() == Method::GET
                     {
-                        info!("serving example index HTML to {}", remote_addr);
+                        log::info!("serving example index HTML to {}", remote_addr);
                         Response::builder().body(Body::from(include_str!("./echo_server.html")))
                     } else if req.uri().path() == "/new_rtc_session" && req.method() == Method::POST
                     {
-                        info!("WebRTC session request from {}", remote_addr);
+                        log::info!("WebRTC session request from {}", remote_addr);
                         match session_endpoint.http_session_request(req.into_body()).await {
                             Ok(mut resp) => {
                                 resp.headers_mut().insert(
@@ -107,25 +106,27 @@ async fn main() {
             .expect("HTTP session server has died");
     });
 
-    let mut message_buf = vec![0; MAX_MESSAGE_LEN];
+    let mut message_buf = Vec::new();
     loop {
-        match rtc_server.recv(&mut message_buf).await {
+        let received = match rtc_server.recv().await {
             Ok(received) => {
-                if let Err(err) = rtc_server
-                    .send(
-                        &message_buf[0..received.message_len],
-                        received.message_type,
-                        &received.remote_addr,
-                    )
-                    .await
-                {
-                    warn!(
-                        "could not send message to {}: {}",
-                        received.remote_addr, err
-                    )
-                }
+                message_buf.clear();
+                message_buf.extend(received.message.as_ref());
+                Some((received.message_type, received.remote_addr))
             }
-            Err(err) => warn!("could not receive RTC message: {}", err),
+            Err(err) => {
+                log::warn!("could not receive RTC message: {}", err);
+                None
+            }
+        };
+
+        if let Some((message_type, remote_addr)) = received {
+            if let Err(err) = rtc_server
+                .send(&message_buf, message_type, &remote_addr)
+                .await
+            {
+                log::warn!("could not send message to {}: {}", remote_addr, err);
+            }
         }
     }
 }

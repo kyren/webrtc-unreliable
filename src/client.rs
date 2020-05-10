@@ -9,7 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::{debug, info, warn};
 use openssl::{
     error::ErrorStack as OpenSslErrorStack,
     ssl::{
@@ -223,7 +222,7 @@ impl Client {
                 mid_handshake.get_mut().incoming_udp.push_back(udp_packet);
                 match mid_handshake.handshake() {
                     Ok(ssl_stream) => {
-                        info!("DTLS handshake finished for remote {}", self.remote_addr);
+                        log::info!("DTLS handshake finished for remote {}", self.remote_addr);
                         ClientSslState::Established(ssl_stream)
                     }
                     Err(handshake_error) => match handshake_error {
@@ -231,7 +230,7 @@ impl Client {
                             return Err(ClientError::OpenSslError(err));
                         }
                         HandshakeError::Failure(mid_handshake) => {
-                            warn!(
+                            log::warn!(
                                 "SSL handshake failure with remote {}: {}",
                                 self.remote_addr,
                                 mid_handshake.error()
@@ -284,7 +283,7 @@ impl Client {
                             }
                         }
                         Err(err) => {
-                            debug!("sctp read error on packet received over DTLS: {}", err);
+                            log::debug!("sctp read error on packet received over DTLS: {}", err);
                         }
                     }
                 }
@@ -292,7 +291,7 @@ impl Client {
                     if err.code() == ErrorCode::WANT_READ {
                         break;
                     } else if err.code() == ErrorCode::ZERO_RETURN {
-                        info!("DTLS received close notify");
+                        log::info!("DTLS received close notify");
                         drop(ssl_buffer);
                         self.start_shutdown()?;
                     } else {
@@ -529,7 +528,7 @@ fn receive_sctp_packet(
                 support_unreliable,
             } => {
                 if !support_unreliable {
-                    warn!("peer does not support selective unreliability, abort connection");
+                    log::warn!("peer does not support selective unreliability, abort connection");
                     client_state.sctp_state = SctpState::Shutdown;
                     return Ok(false);
                 }
@@ -598,7 +597,7 @@ fn receive_sctp_packet(
                 if chunk_flags & SCTP_FLAG_BEGIN_FRAGMENT == 0
                     || chunk_flags & SCTP_FLAG_END_FRAGMENT == 0
                 {
-                    debug!("received fragmented SCTP packet, dropping");
+                    log::debug!("received fragmented SCTP packet, dropping");
                 } else {
                     client_state.sctp_remote_tsn = max_tsn(client_state.sctp_remote_tsn, tsn);
 
@@ -724,12 +723,13 @@ fn receive_sctp_packet(
                 first_param_type,
                 first_param_data,
             } => {
-                warn!(
+                log::warn!(
                     "SCTP error chunk received: {} {:?}",
-                    first_param_type, first_param_data
+                    first_param_type,
+                    first_param_data
                 );
             }
-            chunk => debug!("unhandled SCTP chunk {:?}", chunk),
+            chunk => log::debug!("unhandled SCTP chunk {:?}", chunk),
         }
     }
 
