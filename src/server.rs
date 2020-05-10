@@ -30,11 +30,8 @@ use crate::{
 
 #[derive(Debug)]
 pub enum SendError {
-    /// Non-fatal error trying to send a message to a disconnected client.
+    /// Non-fatal error trying to send a message to an unconnected, unknown, or unestablished client.
     ClientNotConnected,
-    /// Non-fatal error trying to send a message to a client whose WebRTC connection has not been
-    /// established yet or is currently shutting down.
-    ClientConnectionNotEstablished,
     /// Non-fatal error writing a WebRTC Data Channel message that is too large to fit in the
     /// maximum message length.
     IncompleteMessageWrite,
@@ -47,9 +44,6 @@ impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
             SendError::ClientNotConnected => write!(f, "client is not connected"),
-            SendError::ClientConnectionNotEstablished => {
-                write!(f, "client connection is not established")
-            }
             SendError::IncompleteMessageWrite => {
                 write!(f, "incomplete write of WebRTC Data Channel message")
             }
@@ -311,11 +305,8 @@ impl Server {
             .ok_or(SendError::ClientNotConnected)?;
 
         match client.send_message(message_type, message) {
-            Err(ClientError::NotConnected) => {
+            Err(ClientError::NotConnected) | Err(ClientError::NotEstablished) => {
                 return Err(SendError::ClientNotConnected).into();
-            }
-            Err(ClientError::NotEstablished) => {
-                return Err(SendError::ClientConnectionNotEstablished).into();
             }
             Err(ClientError::IncompletePacketWrite) => {
                 return Err(SendError::IncompleteMessageWrite).into();
