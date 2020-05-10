@@ -6,7 +6,7 @@ use hyper::{
     Body, Error, Method, Response, Server, StatusCode,
 };
 
-use webrtc_unreliable::Server as RtcServer;
+use webrtc_unreliable::{Event, Server as RtcServer};
 
 #[tokio::main]
 async fn main() {
@@ -109,11 +109,12 @@ async fn main() {
     let mut message_buf = Vec::new();
     loop {
         let received = match rtc_server.recv().await {
-            Ok(received) => {
+            Ok(Event::IncomingMessage(remote_addr, message_type, received)) => {
                 message_buf.clear();
-                message_buf.extend(received.message.as_ref());
-                Some((received.message_type, received.remote_addr))
+                message_buf.extend(&received[..]);
+                Some((message_type, remote_addr))
             }
+            Ok(_) => None,
             Err(err) => {
                 log::warn!("could not receive RTC message: {}", err);
                 None

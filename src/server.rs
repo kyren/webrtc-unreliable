@@ -61,6 +61,32 @@ impl From<IoError> for SendError {
     }
 }
 
+/// A reference to an internal buffer containing a received message.
+pub struct MessageBuffer<'a>(BufferHandle<'a>);
+
+impl<'a> Deref for MessageBuffer<'a> {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl<'a> AsRef<[u8]> for MessageBuffer<'a> {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub enum Event<'a> {
+    /// A new client connection is completely established
+    Connection(SocketAddr),
+    /// A messages has been received from a connected client
+    IncomingMessage(SocketAddr, MessageType, MessageBuffer<'a>),
+    /// A client has been disconnected
+    Disconnection(SocketAddr),
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     /// `SessionEndpoint` has beeen disconnected from its `Server` (the `Server` has been dropped).
@@ -87,29 +113,6 @@ impl Error for SessionError {
             SessionError::StreamError(e) => Some(e.as_ref()),
         }
     }
-}
-
-/// A reference to an internal buffer containing a received message.
-pub struct MessageBuffer<'a>(BufferHandle<'a>);
-
-impl<'a> Deref for MessageBuffer<'a> {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Vec<u8> {
-        &self.0
-    }
-}
-
-impl<'a> AsRef<[u8]> for MessageBuffer<'a> {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-pub struct MessageResult<'a> {
-    pub message: MessageBuffer<'a>,
-    pub message_type: MessageType,
-    pub remote_addr: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -201,7 +204,7 @@ pub struct Server {
     incoming_session_stream: mpsc::Receiver<IncomingSession>,
     ssl_acceptor: SslAcceptor,
     outgoing_udp: VecDeque<(OwnedBuffer, SocketAddr)>,
-    incoming_rtc: VecDeque<(OwnedBuffer, SocketAddr, MessageType)>,
+    incoming_events: VecDeque<InnerEvent>,
     buffer_pool: BufferPool,
     sessions: HashMap<SessionKey, Session>,
     clients: HashMap<SocketAddr, Client>,
@@ -242,7 +245,7 @@ impl Server {
             incoming_session_stream: session_receiver,
             ssl_acceptor: crypto.ssl_acceptor,
             outgoing_udp: VecDeque::new(),
-            incoming_rtc: VecDeque::new(),
+            incoming_events: VecDeque::new(),
             buffer_pool: BufferPool::new(),
             sessions: HashMap::new(),
             clients: HashMap::new(),
@@ -348,18 +351,22 @@ impl Server {
     /// If the provided buffer is not large enough to hold the received message, the received
     /// message will be truncated, and the original length will be returned as part of
     /// `MessageResult`.
-    pub async fn recv(&mut self) -> Result<MessageResult<'_>, IoError> {
-        while self.incoming_rtc.is_empty() {
-            self.process().await?;
+    pub async fn recv(&mut self) -> Result<Event<'_>, IoError> {
+        loop {
+            match self.incoming_events.pop_front() {
+                Some(InnerEvent::IncomingMessage(message, remote_addr, message_type)) => {
+                    let message = MessageBuffer(self.buffer_pool.adopt(message));
+                    return Ok(Event::IncomingMessage(remote_addr, message_type, message));
+                }
+                Some(InnerEvent::Connection(remote_addr)) => {
+                    return Ok(Event::Connection(remote_addr));
+                }
+                Some(InnerEvent::Disconnection(remote_addr)) => {
+                    return Ok(Event::Disconnection(remote_addr));
+                }
+                None => self.process().await?,
+            }
         }
-
-        let (message, remote_addr, message_type) = self.incoming_rtc.pop_front().unwrap();
-        let message = MessageBuffer(self.buffer_pool.adopt(message));
-        return Ok(MessageResult {
-            message,
-            message_type,
-            remote_addr,
-        });
     }
 
     // Accepts new incoming WebRTC sessions, times out existing WebRTC sessions, sends outgoing UDP
@@ -480,6 +487,7 @@ impl Server {
             }
         } else {
             if let Some(client) = self.clients.get_mut(&remote_addr) {
+                let was_established = client.is_established();
                 if let Err(err) = client.receive_incoming_packet(packet_buffer.into_owned()) {
                     if !client.shutdown_started() {
                         log::warn!(
@@ -489,13 +497,17 @@ impl Server {
                         let _ = client.start_shutdown();
                     }
                 }
+                if !was_established && client.is_established() {
+                    self.incoming_events
+                        .push_back(InnerEvent::Connection(remote_addr));
+                }
                 self.outgoing_udp
                     .extend(client.take_outgoing_packets().map(|p| (p, remote_addr)));
-                self.incoming_rtc.extend(
-                    client
-                        .receive_messages()
-                        .map(|(message_type, message)| (message, remote_addr, message_type)),
-                );
+                self.incoming_events.extend(client.receive_messages().map(
+                    |(message_type, message)| {
+                        InnerEvent::IncomingMessage(message, remote_addr, message_type)
+                    },
+                ));
             }
         }
     }
@@ -535,17 +547,21 @@ impl Server {
                 }
             });
 
-            self.clients.retain(|remote_addr, client| {
-                if !client.is_shutdown()
-                    && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
-                {
-                    true
-                } else {
-                    if !client.is_shutdown() {
-                        log::info!("connection timeout for client {}", remote_addr);
+            self.clients.retain({
+                let incoming_events = &mut self.incoming_events;
+                move |remote_addr, client| {
+                    if !client.is_shutdown()
+                        && client.last_activity().elapsed() < RTC_CONNECTION_TIMEOUT
+                    {
+                        true
+                    } else {
+                        if !client.is_shutdown() {
+                            log::info!("connection timeout for client {}", remote_addr);
+                        }
+                        log::info!("client {} removed", remote_addr);
+                        incoming_events.push_back(InnerEvent::Disconnection(*remote_addr));
+                        false
                     }
-                    log::info!("client {} removed", remote_addr);
-                    false
                 }
             });
         }
@@ -592,4 +608,10 @@ struct IncomingSession {
     pub server_user: String,
     pub server_passwd: String,
     pub remote_user: String,
+}
+
+enum InnerEvent {
+    IncomingMessage(OwnedBuffer, SocketAddr, MessageType),
+    Connection(SocketAddr),
+    Disconnection(SocketAddr),
 }
