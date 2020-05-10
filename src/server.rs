@@ -79,11 +79,11 @@ impl<'a> AsRef<[u8]> for MessageBuffer<'a> {
 }
 
 pub enum Event<'a> {
-    /// A new client connection is completely established
+    /// A new client connection is completely established.
     Connection(SocketAddr),
-    /// A messages has been received from a connected client
+    /// A messages has been received from a connected client.
     IncomingMessage(SocketAddr, MessageType, MessageBuffer<'a>),
-    /// A client has been disconnected
+    /// A client has been completely disconnected and removed.
     Disconnection(SocketAddr),
 }
 

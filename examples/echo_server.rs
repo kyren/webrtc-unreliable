@@ -109,12 +109,19 @@ async fn main() {
     let mut message_buf = Vec::new();
     loop {
         let received = match rtc_server.recv().await {
+            Ok(Event::Connection(remote_addr)) => {
+                log::info!("new connection: {:?}", remote_addr);
+                None
+            }
             Ok(Event::IncomingMessage(remote_addr, message_type, received)) => {
                 message_buf.clear();
                 message_buf.extend(&received[..]);
                 Some((message_type, remote_addr))
             }
-            Ok(_) => None,
+            Ok(Event::Disconnection(remote_addr)) => {
+                log::info!("dropped connection: {:?}", remote_addr);
+                None
+            }
             Err(err) => {
                 log::warn!("could not receive RTC message: {}", err);
                 None
