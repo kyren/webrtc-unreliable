@@ -34,15 +34,15 @@ than 1200 bytes.
 
 ## Running the example
 
-In ```./examples/```:
+In a terminal: 
 
 ```
 $cargo run --example echo_server -- --data 127.0.0.1:42424 --http 127.0.0.1:8080 --public 127.0.0.1:42424
 ```
 
-Following that check out the example http service and see if you need to update it:
+Then, using a web browser, go to 'http://127.0.0.1:8080/index.html'. Open the debug console, if everything is working correctly you should see messages being sent and received.
 
-https://github.com/kyren/webrtc-unreliable/blob/f848b73c4f40222682596855ae045cfec940d7e4/examples/echo_server.html
+Please note that if you are using Firefox, Firefox does not accept WebRTC connections to 127.0.0.1, so you may need to use a different IP address.
 
 ## Credit
 
