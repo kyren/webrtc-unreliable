@@ -11,21 +11,20 @@ keywords = ["wasm", "webrtc"]
 license = "MIT"
 
 [dependencies]
+async-io = "1.1"
 byteorder = "1.3"
 crc = "1.8.1"
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
-futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["sink"] }
 http = "0.2"
 log = "0.4"
 openssl = "0.10"
 rand = "0.7"
-tokio = { version = "0.2.0", features = ["net", "time"] }
 
 [dev-dependencies]
 clap = "2.32"
-env_logger = "0.7"
+env_logger = "0.8"
 futures = { version = "0.3" }
 hyper = { version = "0.13", features = ["stream"] }
 tokio = { version = "0.2", features = ["macros"] }

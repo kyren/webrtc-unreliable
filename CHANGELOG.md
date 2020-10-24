@@ -1,3 +1,19 @@
+## [0.5]
+- Change crc32c dependency to crc to unbreak ARM build (thanks @tchamelot!),
+- Remove crc32fast in favor of only using crc dependency.
+- Handle better clients which have errored and are shutting down without
+  spamming log warnings.
+- Dont' deliver incoming messages in fragmented SCTP packets as whole messages,
+  we do not support fragmented SCTP at all yet.
+- API incompatible change: Simplify the API for receiving messages, returning a
+  borrowed buffer for incoming messages, eliminating both `RecvError` and a
+  needless memcpy.
+- API incompatible change: There is no longer a distinction between a client
+  that is not fully connected and a client that has been disconnected, both are
+  now just `NotConnected`.
+- Add a method on the server to list all currently established connections.
+- Dependency change from tokio to async-io, no longer requires a tokio runtime.
+
 ## [0.4.1]
 - Remove crossbeam dependency, use a new buffer pooling strategy that should be
   much faster

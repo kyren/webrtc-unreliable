@@ -1,6 +1,7 @@
 mod buffer_pool;
 mod client;
 mod crypto;
+mod interval;
 mod sctp;
 mod sdp;
 mod server;

@@ -4,25 +4,25 @@ use std::{
     error::Error,
     fmt,
     io::{Error as IoError, ErrorKind as IoErrorKind},
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket},
     ops::Deref,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use async_io::Async;
 use futures_channel::mpsc;
 use futures_core::Stream;
 use futures_util::{pin_mut, select, FutureExt, SinkExt, StreamExt};
 use http::{header, Response};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
-use tokio::net::UdpSocket;
-use tokio::time::{self, Interval};
 
 use crate::{
     buffer_pool::{BufferHandle, BufferPool, OwnedBuffer},
     client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
+    interval::Interval,
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
     stun::{parse_stun_binding_request, write_stun_success_response},
     util::rand_string,
@@ -196,7 +196,7 @@ impl SessionEndpoint {
 }
 
 pub struct Server {
-    udp_socket: UdpSocket,
+    udp_socket: Async<UdpSocket>,
     session_endpoint: SessionEndpoint,
     incoming_session_stream: mpsc::Receiver<IncomingSession>,
     ssl_acceptor: SslAcceptor,
@@ -220,7 +220,7 @@ impl Server {
         const SESSION_BUFFER_SIZE: usize = 8;
 
         let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
-        let udp_socket = UdpSocket::bind(&listen_addr).await?;
+        let udp_socket = Async::new(UdpSocket::bind(&listen_addr)?)?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
 
@@ -248,7 +248,7 @@ impl Server {
             clients: HashMap::new(),
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
-            periodic_timer: time::interval(PERIODIC_TIMER_INTERVAL),
+            periodic_timer: Interval::new(PERIODIC_TIMER_INTERVAL),
         })
     }
 
@@ -377,7 +377,7 @@ impl Server {
             let recv_udp = self.udp_socket.recv_from(&mut packet_buffer).fuse();
             pin_mut!(recv_udp);
 
-            let timer_next = self.periodic_timer.tick().fuse();
+            let timer_next = self.periodic_timer.next().fuse();
             pin_mut!(timer_next);
 
             select! {
@@ -428,7 +428,7 @@ impl Server {
     async fn send_outgoing(&mut self) -> Result<(), IoError> {
         while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
             let packet = self.buffer_pool.adopt(packet);
-            let len = self.udp_socket.send_to(&packet, &remote_addr).await?;
+            let len = self.udp_socket.send_to(&packet, remote_addr).await?;
             let packet_len = packet.len();
             if len != packet_len {
                 return Err(IoError::new(
