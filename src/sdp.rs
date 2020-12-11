@@ -85,12 +85,12 @@ pub fn gen_sdp_response<R: Rng>(
         "{{\"answer\":{{\"sdp\":\"v=0\\r\\n\
          o=- {rand1} 1 IN {ipv} {port}\\r\\n\
          s=-\\r\\n\
-         t=0 0\\r\\n\
-         m=application {port} UDP/DTLS/SCTP webrtc-datachannel\\r\\n\
          c=IN {ipv} {ip}\\r\\n\
+         t=0 0\\r\\n\
          a=ice-lite\\r\\n\
          a=ice-ufrag:{ufrag}\\r\\n\
          a=ice-pwd:{pass}\\r\\n\
+         m=application {port} UDP/DTLS/SCTP webrtc-datachannel\\r\\n\
          a=fingerprint:sha-256 {fingerprint}\\r\\n\
          a=ice-options:trickle\\r\\n\
          a=setup:passive\\r\\n\
