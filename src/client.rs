@@ -160,9 +160,15 @@ impl Client {
                     self.client_state.last_sent = Instant::now();
                     self.client_state.sctp_state = SctpState::Shutdown;
                 }
-                match ssl_stream.shutdown().map_err(ssl_err_to_client_err)? {
-                    ShutdownResult::Sent => ClientSslState::ShuttingDown(ssl_stream),
-                    ShutdownResult::Received => ClientSslState::Shutdown,
+                match ssl_stream.shutdown() {
+                    Err(err) => {
+                        if err.code() == ErrorCode::ZERO_RETURN {
+                            ClientSslState::Shutdown
+                        } else {
+                            return Err(ssl_err_to_client_err(err));
+                        }
+                    }
+                    Ok(res) => ClientSslState::ShuttingDown(ssl_stream, res),
                 }
             }
             prev_state => prev_state,
@@ -173,15 +179,16 @@ impl Client {
     /// Returns true if the shutdown process has been started or has already finished.
     pub fn shutdown_started(&self) -> bool {
         match &self.ssl_state {
-            ClientSslState::ShuttingDown(_) | ClientSslState::Shutdown => true,
+            ClientSslState::ShuttingDown(_, _) | ClientSslState::Shutdown => true,
             _ => false,
         }
     }
 
-    /// Connection has either timed out or finished shutting down.
+    /// Connection has finished shutting down.
     pub fn is_shutdown(&self) -> bool {
         match &self.ssl_state {
-            ClientSslState::Shutdown => true,
+            ClientSslState::ShuttingDown(_, ShutdownResult::Received)
+            | ClientSslState::Shutdown => true,
             _ => false,
         }
     }
@@ -247,21 +254,22 @@ impl Client {
                 ssl_stream.get_mut().incoming_udp.push_back(udp_packet);
                 ClientSslState::Established(ssl_stream)
             }
-            ClientSslState::ShuttingDown(mut ssl_stream) => {
+            ClientSslState::ShuttingDown(mut ssl_stream, shutdown_result) => {
                 ssl_stream.get_mut().incoming_udp.push_back(udp_packet);
                 match ssl_stream.shutdown() {
                     Err(err) => {
                         if err.code() == ErrorCode::WANT_READ {
-                            ClientSslState::ShuttingDown(ssl_stream)
+                            ClientSslState::ShuttingDown(ssl_stream, shutdown_result)
+                        } else if err.code() == ErrorCode::ZERO_RETURN {
+                            ClientSslState::Shutdown
                         } else {
                             return Err(ssl_err_to_client_err(err));
                         }
                     }
-                    Ok(ShutdownResult::Sent) => ClientSslState::ShuttingDown(ssl_stream),
-                    Ok(ShutdownResult::Received) => ClientSslState::Shutdown,
+                    Ok(res) => ClientSslState::ShuttingDown(ssl_stream, res),
                 }
             }
-            ClientSslState::Shutdown => return Err(ClientError::NotConnected),
+            ClientSslState::Shutdown => ClientSslState::Shutdown,
         };
 
         while let ClientSslState::Established(ssl_stream) = &mut self.ssl_state {
@@ -309,7 +317,8 @@ impl Client {
             ClientSslState::Handshake(mid_handshake) => {
                 Some(mid_handshake.get_mut().outgoing_udp.drain(..))
             }
-            ClientSslState::Established(ssl_stream) | ClientSslState::ShuttingDown(ssl_stream) => {
+            ClientSslState::Established(ssl_stream)
+            | ClientSslState::ShuttingDown(ssl_stream, _) => {
                 Some(ssl_stream.get_mut().outgoing_udp.drain(..))
             }
             ClientSslState::Shutdown => None,
@@ -390,7 +399,7 @@ pub struct ClientState {
 enum ClientSslState {
     Handshake(MidHandshakeSslStream<ClientSslPackets>),
     Established(SslStream<ClientSslPackets>),
-    ShuttingDown(SslStream<ClientSslPackets>),
+    ShuttingDown(SslStream<ClientSslPackets>, ShutdownResult),
     Shutdown,
 }
 

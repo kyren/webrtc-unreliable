@@ -288,7 +288,7 @@ impl Server {
     }
 
     /// Disconect the given client, does nothing if the client is not currently connected.
-    pub fn disconnect(&mut self, remote_addr: &SocketAddr) {
+    pub async fn disconnect(&mut self, remote_addr: &SocketAddr) -> Result<(), IoError> {
         if let Some(client) = self.clients.get_mut(remote_addr) {
             if let Err(err) = client.start_shutdown() {
                 log::warn!(
@@ -299,7 +299,13 @@ impl Server {
             } else {
                 log::info!("starting shutdown for client {}", remote_addr);
             }
+
+            self.outgoing_udp
+                .extend(client.take_outgoing_packets().map(|p| (p, *remote_addr)));
+            self.send_outgoing().await?
         }
+
+        Ok(())
     }
 
     /// Send the given message to the given remote client, if they are connected.
