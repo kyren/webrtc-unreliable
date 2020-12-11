@@ -142,9 +142,11 @@ impl Client {
     }
 
     /// Request SCTP and DTLS shutdown, connection immediately becomes un-established
-    pub fn start_shutdown(&mut self) -> Result<(), ClientError> {
+    pub fn start_shutdown(&mut self) -> Result<bool, ClientError> {
+        let started;
         self.ssl_state = match mem::replace(&mut self.ssl_state, ClientSslState::Shutdown) {
             ClientSslState::Established(mut ssl_stream) => {
+                started = true;
                 if self.client_state.sctp_state != SctpState::Shutdown {
                     // TODO: For now, we just do an immediate one-sided SCTP abort
                     send_sctp_packet(
@@ -171,9 +173,12 @@ impl Client {
                     Ok(res) => ClientSslState::ShuttingDown(ssl_stream, res),
                 }
             }
-            prev_state => prev_state,
+            prev_state => {
+                started = false;
+                prev_state
+            }
         };
-        Ok(())
+        Ok(started)
     }
 
     /// Returns true if the shutdown process has been started or has already finished.

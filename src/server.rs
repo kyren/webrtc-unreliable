@@ -290,14 +290,18 @@ impl Server {
     /// Disconect the given client, does nothing if the client is not currently connected.
     pub async fn disconnect(&mut self, remote_addr: &SocketAddr) -> Result<(), IoError> {
         if let Some(client) = self.clients.get_mut(remote_addr) {
-            if let Err(err) = client.start_shutdown() {
-                log::warn!(
-                    "error starting shutdown for client {}: {}",
-                    remote_addr,
-                    err
-                );
-            } else {
-                log::info!("starting shutdown for client {}", remote_addr);
+            match client.start_shutdown() {
+                Ok(true) => {
+                    log::info!("starting shutdown for client {}", remote_addr);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    log::warn!(
+                        "error starting shutdown for client {}: {}",
+                        remote_addr,
+                        err
+                    );
+                }
             }
 
             self.outgoing_udp
