@@ -1,9 +1,9 @@
 use clap::{App, Arg};
 use hyper::{
     header::{self, HeaderValue},
-    server::conn::AddrStream,
+    server::{conn::AddrStream, Server},
     service::{make_service_fn, service_fn},
-    Body, Error, Method, Response, Server, StatusCode,
+    Body, Error, Method, Response, StatusCode,
 };
 
 use webrtc_unreliable::Server as RtcServer;

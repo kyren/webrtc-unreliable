@@ -7,7 +7,7 @@ pub fn rand_string<R: Rng>(rng: &mut R, size: usize) -> String {
     let mut s = String::new();
     s.reserve(size);
     for _ in 0..size {
-        s.push(RAND_CHAR_TABLE[rng.gen_range(0, 62)] as char);
+        s.push(RAND_CHAR_TABLE[rng.gen_range(0..RAND_CHAR_TABLE.len())] as char);
     }
     s
 }
