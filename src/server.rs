@@ -30,8 +30,8 @@ use crate::{
 
 #[derive(Debug)]
 pub enum SendError {
-    /// Non-fatal error trying to send a message to an unknown, disconnected, or unestablished
-    /// client.
+    /// Non-fatal error trying to send a message to an unknown, disconnected, or not fully
+    /// established client.
     ClientNotConnected,
     /// Non-fatal error writing a WebRTC Data Channel message that is too large to fit in the
     /// maximum message length.
@@ -265,7 +265,13 @@ impl Server {
         self.session_endpoint.clone()
     }
 
-    /// List all the currently established client connections.
+    /// The total count of clients in any active state, whether still starting up, fully
+    /// established, or still shutting down.
+    pub fn active_clients(&self) -> usize {
+        self.clients.values().filter(|c| !c.is_shutdown()).count()
+    }
+
+    /// List all the currently fully established client connections.
     pub fn connected_clients(&self) -> impl Iterator<Item = &SocketAddr> + '_ {
         self.clients.iter().filter_map(|(addr, client)| {
             if client.is_established() {
