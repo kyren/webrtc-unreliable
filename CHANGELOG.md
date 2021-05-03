@@ -1,3 +1,14 @@
+## [0.5.1]
+- *Attempt* to handle DTLS shutdown correctly at least when there is no packet
+  loss.
+- Fix some bugs causing at least firefox to complain about ice attributes being
+  incorrectly at the media level.
+- Don't log "starting shutdown" if the client has already shutdown.
+- Update rand dependency.
+- Add a method to check whether any clients are not fully shutdown.  This should
+  *theoretically* make it possible to implement an *attempt* at clean shutdown
+  for all clients.  See issue #15.
+
 ## [0.5]
 - Change crc32c dependency to crc to unbreak ARM build (thanks @tchamelot!),
 - Remove crc32fast in favor of only using crc dependency.
