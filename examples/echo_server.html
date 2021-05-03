@@ -14,6 +14,55 @@
             }]
         });
 
+        let channel = peer.createDataChannel("data", {
+            ordered: false,
+            maxRetransmits: 0
+        });
+        channel.binaryType = "arraybuffer";
+
+        channel.onerror = function(evt) {
+            console.log("data channel error:", evt.message);
+        };
+
+        let send_times = {};
+        channel.onopen = function() {
+            console.log("data channel open");
+
+            let packet_number = 0
+            let cancel = setInterval(function() {
+                if (packet_number == NUM_PACKETS) {
+                    clearInterval(cancel);
+                    console.log("closing connection");
+                    peer.close();
+                } else {
+                    packet_number++
+                    console.log("sending packet", packet_number);
+                    let array = new Uint8Array(1000);
+                    array[0] = packet_number;
+                    channel.send(array);
+                    send_times[packet_number] = Date.now();
+                }
+            }, SEND_INTERVAL);
+
+            channel.onmessage = function(evt) {
+                let array = new Uint8Array(evt.data);
+                let num = Number(array[0]);
+                console.log(
+                    "received packet " + num,
+                    "of length " + evt.data.byteLength,
+                    "in " + (Date.now() - send_times[num]) + " ms"
+                );
+            };
+        };
+
+        peer.onicecandidate = function(evt) {
+            if (evt.candidate) {
+                console.log("received ice candidate", evt.candidate);
+            } else {
+                console.log("all local candidates received");
+            }
+        };
+
         peer.createOffer().then(function(offer) {
             return peer.setLocalDescription(offer);
         }).then(function() {
@@ -38,56 +87,6 @@
         }).catch(function(reason) {
             console.log("error during 'createOffer':", reason);
         });
-
-        peer.onicecandidate = function(evt) {
-            if (evt.candidate) {
-                console.log("received ice candidate", evt.candidate);
-            } else {
-                console.log("all local candidates received");
-            }
-        };
-
-        let channel = peer.createDataChannel("data", {
-            ordered: false,
-            maxRetransmits: 0
-        });
-        channel.binaryType = "arraybuffer";
-
-        let send_times = {};
-        channel.onopen = function() {
-            console.log("data channel open");
-
-            let packet_number = 0
-            let cancel = setInterval(function() {
-                if (packet_number == NUM_PACKETS) {
-                    clearInterval(cancel);
-                    console.log("closing connection");
-                    peer.close();
-                } else {
-                    packet_number++
-                    console.log("sending packet", packet_number);
-                    let array = new Uint8Array(1172);
-                    array[0] = packet_number;
-                    channel.send(array);
-                    send_times[packet_number] = Date.now();
-                }
-            }, SEND_INTERVAL);
-
-            channel.onmessage = function(evt) {
-                let array = new Uint8Array(evt.data);
-                let num = Number(array[0]);
-                console.log(
-                    "received packet " + num,
-                    "of length " + evt.data.byteLength,
-                    "in " + (Date.now() - send_times[num]) + " ms"
-                );
-            };
-        };
-
-        channel.onerror = function(evt) {
-            console.log("data channel error:", evt.message);
-        };
-
     </script>
 </head>
 <body></body>
