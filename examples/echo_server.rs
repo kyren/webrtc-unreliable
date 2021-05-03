@@ -85,9 +85,12 @@ async fn main() {
                                 );
                                 Ok(resp.map(Body::from))
                             }
-                            Err(err) => Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Body::from(format!("error: {}", err))),
+                            Err(err) => {
+                                log::warn!("bad rtc session request: {:?}", err);
+                                Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(Body::from(format!("error: {:?}", err)))
+                            }
                         }
                     } else {
                         Response::builder()
@@ -115,7 +118,7 @@ async fn main() {
                 Some((received.message_type, received.remote_addr))
             }
             Err(err) => {
-                log::warn!("could not receive RTC message: {}", err);
+                log::warn!("could not receive RTC message: {:?}", err);
                 None
             }
         };
@@ -125,7 +128,7 @@ async fn main() {
                 .send(&message_buf, message_type, &remote_addr)
                 .await
             {
-                log::warn!("could not send message to {}: {}", remote_addr, err);
+                log::warn!("could not send message to {}: {:?}", remote_addr, err);
             }
         }
     }

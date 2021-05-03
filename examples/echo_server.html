@@ -8,7 +8,11 @@
         let SEND_INTERVAL = 500;
         let SESSION_ADDRESS = "/new_rtc_session";
 
-        let peer = new RTCPeerConnection(null);
+        let peer = new RTCPeerConnection({
+            iceServers: [{
+                urls: ["stun:stun.l.google.com:19302"]
+            }]
+        });
 
         peer.createOffer().then(function(offer) {
             return peer.setLocalDescription(offer);
@@ -34,6 +38,14 @@
         }).catch(function(reason) {
             console.log("error during 'createOffer':", reason);
         });
+
+        peer.onicecandidate = function(evt) {
+            if (evt.candidate) {
+                console.log("received ice candidate", evt.candidate);
+            } else {
+                console.log("all local candidates received");
+            }
+        };
 
         let channel = peer.createDataChannel("data", {
             ordered: false,

@@ -596,7 +596,7 @@ fn iter_params<'a>(
     struct ParamIterator<'a> {
         data: &'a [u8],
         index: usize,
-    };
+    }
 
     impl<'a> Iterator for ParamIterator<'a> {
         type Item = Result<(u16, &'a [u8]), IterParamsError>;
