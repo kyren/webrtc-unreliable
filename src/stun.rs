@@ -1,7 +1,7 @@
 use std::{error, net::SocketAddr, str};
 
 use byteorder::{ByteOrder, NetworkEndian};
-use crc::{crc32, Hasher32};
+use crc::{Crc, CRC_32_ISO_HDLC};
 use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer};
 
 pub type Error = Box<dyn error::Error + Send + Sync>;
@@ -74,6 +74,8 @@ pub fn write_stun_success_response(
     passwd: &[u8],
     out: &mut [u8],
 ) -> Result<usize, Error> {
+    const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+
     const ATTRIBUTE_MARKER_LEN: usize = 4;
     const IPV4_ADDR_ATTRIBUTE_LEN: usize = 8;
     const IPV6_ADDR_ATTRIBUTE_LEN: usize = 20;
@@ -147,11 +149,11 @@ pub fn write_stun_success_response(
 
     NetworkEndian::write_u16(&mut header[2..4], content_len as u16);
 
-    let mut crc = crc32::Digest::new(crc32::IEEE);
-    crc.write(&header);
-    crc.write(&addr_attribute);
-    crc.write(&integrity_attribute);
-    let crc = crc.sum32();
+    let mut digest = CRC.digest();
+    digest.update(&header);
+    digest.update(&addr_attribute);
+    digest.update(&integrity_attribute);
+    let crc = digest.finalize();
 
     NetworkEndian::write_u16(
         &mut fingerprint_attribute[0..2],

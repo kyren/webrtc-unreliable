@@ -1,7 +1,7 @@
 use std::{convert::TryInto, error::Error, fmt};
 
 use byteorder::{ByteOrder, LittleEndian, NetworkEndian};
-use crc::{crc32, Hasher32};
+use crc::{Crc, CRC_32_ISCSI};
 
 pub const SCTP_FLAG_END_FRAGMENT: u8 = 0x01;
 pub const SCTP_FLAG_BEGIN_FRAGMENT: u8 = 0x02;
@@ -116,11 +116,11 @@ pub fn read_sctp_packet<'a>(
     let checksum = LittleEndian::read_u32(&src[8..12]);
 
     if check_crc {
-        let mut crc = crc32::Digest::new(crc32::CASTAGNOLI);
-        crc.write(&src[0..8]);
-        crc.write(&[0, 0, 0, 0]);
-        crc.write(&src[12..]);
-        if checksum != crc.sum32() {
+        let mut digest = CRC.digest();
+        digest.update(&src[0..8]);
+        digest.update(&[0, 0, 0, 0]);
+        digest.update(&src[12..]);
+        if checksum != digest.finalize() {
             return Err(SctpReadError::BadChecksum);
         }
     }
@@ -553,11 +553,13 @@ pub fn write_sctp_packet(dest: &mut [u8], packet: SctpPacket) -> Result<usize, S
 
     let remainder = rest.len();
     let len = dest.len() - remainder;
-    let crc = crc32::checksum_castagnoli(&dest[0..len]);
+    let crc = CRC.checksum(&dest[0..len]);
     LittleEndian::write_u32(&mut dest[8..12], crc);
 
     Ok(len)
 }
+
+const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 const CHUNK_TYPE_DATA: u8 = 0x00;
 const CHUNK_TYPE_INIT: u8 = 0x01;
