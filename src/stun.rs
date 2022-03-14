@@ -36,12 +36,12 @@ pub fn parse_stun_binding_request(bytes: &[u8]) -> Option<StunBindingRequest> {
     transaction_id.copy_from_slice(&bytes[8..STUN_HEADER_LEN]);
 
     let mut offset = STUN_HEADER_LEN;
-    while offset < length - 4 {
+    while offset < STUN_HEADER_LEN + length - 4 {
         let payload_type = NetworkEndian::read_u16(&bytes[offset..offset + 2]);
         let payload_len = NetworkEndian::read_u16(&bytes[offset + 2..offset + 4]) as usize;
         offset += 4;
         let padded_len = (payload_len + STUN_ALIGNMENT - 1) & !(STUN_ALIGNMENT - 1);
-        if offset + padded_len > length {
+        if offset + padded_len > STUN_HEADER_LEN + length {
             return None;
         }
         if payload_type == StunAttributeType::User as u16 {
