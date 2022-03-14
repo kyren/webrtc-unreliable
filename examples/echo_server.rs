@@ -1,4 +1,4 @@
-use clap::{Command, Arg};
+use clap::{Arg, Command};
 use hyper::{
     header::{self, HeaderValue},
     server::{conn::AddrStream, Server},

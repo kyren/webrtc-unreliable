@@ -1,3 +1,8 @@
+## [0.5.2]
+- Fix a bug in STUN parsing that causes failures if the User attribute is the
+  last attribute in the packet.
+- Update internal crc dependency
+
 ## [0.5.1]
 - *Attempt* to handle DTLS shutdown correctly at least when there is no packet
   loss.
