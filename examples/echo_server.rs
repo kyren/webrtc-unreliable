@@ -1,4 +1,4 @@
-use clap::{App, Arg};
+use clap::{Command, Arg};
 use hyper::{
     header::{self, HeaderValue},
     server::{conn::AddrStream, Server},
@@ -12,26 +12,26 @@ use webrtc_unreliable::Server as RtcServer;
 async fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
 
-    let matches = App::new("echo_server")
+    let matches = Command::new("echo_server")
         .arg(
-            Arg::with_name("data")
-                .short("d")
+            Arg::new("data")
+                .short('d')
                 .long("data")
                 .takes_value(true)
                 .required(true)
                 .help("listen on the specified address/port for UDP WebRTC data channels"),
         )
         .arg(
-            Arg::with_name("public")
-                .short("p")
+            Arg::new("public")
+                .short('p')
                 .long("public")
                 .takes_value(true)
                 .required(true)
                 .help("advertise the given address/port as the public WebRTC address/port"),
         )
         .arg(
-            Arg::with_name("http")
-                .short("h")
+            Arg::new("http")
+                .short('h')
                 .long("http")
                 .takes_value(true)
                 .required(true)
