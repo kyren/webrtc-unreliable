@@ -8,11 +8,7 @@
         let SEND_INTERVAL = 500;
         let SESSION_ADDRESS = "/new_rtc_session";
 
-        let peer = new RTCPeerConnection({
-            iceServers: [{
-                urls: ["stun:stun.l.google.com:19302"]
-            }]
-        });
+        let peer = new RTCPeerConnection();
 
         let channel = peer.createDataChannel("data", {
             ordered: false,
