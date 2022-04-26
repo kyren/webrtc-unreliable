@@ -13,7 +13,7 @@ license = "MIT"
 [dependencies]
 async-io = "1.1"
 byteorder = "1.3"
-crc = "2"
+crc = "3.0"
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-util = { version = "0.3", features = ["sink"] }
