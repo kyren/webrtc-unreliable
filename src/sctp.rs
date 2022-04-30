@@ -179,12 +179,29 @@ pub fn read_sctp_packet<'a>(
                     for param in iter_params(&chunk_data, 16) {
                         match param {
                             Err(_) => return Err(SctpReadError::BadPacket),
-                            Ok((ty, _)) => {
-                                if ty == INIT_PARAM_FORWARD_TSN {
+                            Ok((param_type, param_data)) => match param_type {
+                                INIT_PARAM_FORWARD_TSN => {
                                     support_unreliable = true;
                                     break;
                                 }
-                            }
+                                INIT_PARAM_SUPPORTED_EXTENSIONS => {
+                                    let mut index = 0;
+                                    'inner: loop {
+                                        if index >= param_data.len() {
+                                            break 'inner;
+                                        }
+                                        if param_data[index] == INIT_PARAM_EXT_FORWARD_TSN {
+                                            support_unreliable = true;
+                                            break 'inner;
+                                        }
+                                        index += 1;
+                                    }
+                                    if support_unreliable {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                     }
 
@@ -585,6 +602,8 @@ const CHUNK_TYPE_I_FORWARD_TSN: u8 = 0xc2;
 
 const INIT_ACK_PARAM_STATE_COOKIE: u16 = 0x07;
 const INIT_PARAM_FORWARD_TSN: u16 = 0xc000;
+const INIT_PARAM_SUPPORTED_EXTENSIONS: u16 = 0x8008;
+const INIT_PARAM_EXT_FORWARD_TSN: u8 = 0xc0;
 const HEARTBEAT_PARAM_INFO: u16 = 0x07;
 
 enum IterParamsError {
