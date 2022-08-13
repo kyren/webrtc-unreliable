@@ -54,7 +54,6 @@ impl Crypto {
         }
 
         let mut ssl_acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::dtls())?;
-        ssl_acceptor_builder.set_tlsext_use_srtp("SRTP_AEAD_AES_256_GCM:SRTP_AEAD_AES_128_GCM").unwrap();
 
         // `webrtc-unreliable` does not bother to verify client certificates because it is designed
         // to be used as a dedicated server with arbitrary clients.  The client will verify the
