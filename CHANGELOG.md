@@ -1,3 +1,6 @@
+## [0.5.3]
+- Handle FORWARD_TSN support in SCTP when it is specified as an extension
+
 ## [0.5.2]
 - Fix a bug in STUN parsing that causes failures if the User attribute is the
   last attribute in the packet.
