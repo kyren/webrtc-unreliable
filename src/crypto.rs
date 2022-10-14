@@ -23,17 +23,20 @@ impl Crypto {
         const X509_DAYS_NOT_BEFORE: u32 = 0;
         const X509_DAYS_NOT_AFTER: u32 = 365;
 
-        // TODO: Let the user pick the public key algorithm and x509 digest algorithm.
-
-        let rsa = Rsa::generate(2048)?;
+        // TODO: Let the user pick the crypto settings?
+        let rsa = Rsa::generate(4096)?;
         let key = PKey::from_rsa(rsa)?;
+        let x509_sign_digest = MessageDigest::sha256();
+
+        // TODO: Fingerprint digest is hard-coded to 'sha-256' in SDP.
+        let x509_fingerprint_digest = MessageDigest::sha256();
 
         let mut name_builder = X509NameBuilder::new()?;
         name_builder.append_entry_by_nid(Nid::COMMONNAME, "webrtc-unreliable")?;
         let name = name_builder.build();
 
         let mut x509_builder = X509::builder()?;
-        x509_builder.set_version(0)?;
+        x509_builder.set_version(2)?;
         x509_builder.set_subject_name(&name)?;
         x509_builder.set_issuer_name(&name)?;
         let not_before = Asn1Time::days_from_now(X509_DAYS_NOT_BEFORE)?;
@@ -41,10 +44,10 @@ impl Crypto {
         x509_builder.set_not_before(&not_before)?;
         x509_builder.set_not_after(&not_after)?;
         x509_builder.set_pubkey(&key)?;
-        x509_builder.sign(&key, MessageDigest::sha256())?;
+        x509_builder.sign(&key, x509_sign_digest)?;
         let x509 = x509_builder.build();
 
-        let x509_digest = x509.digest(MessageDigest::sha256())?;
+        let x509_digest = x509.digest(x509_fingerprint_digest)?;
         let mut fingerprint = String::new();
         for i in 0..x509_digest.len() {
             write!(fingerprint, "{:02X}", x509_digest[i]).unwrap();
