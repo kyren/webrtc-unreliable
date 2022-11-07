@@ -50,7 +50,7 @@ impl crate::runtime::Runtime for Runtime {
     type UdpSocket = UdpSocket;
 
     fn bind_udp(&self, listen_addr: SocketAddr) -> Result<UdpSocket, io::Error> {
-        let socket =  std::net::UdpSocket::bind(listen_addr)?;
+        let socket = std::net::UdpSocket::bind(listen_addr)?;
         socket.set_nonblocking(true)?;
         Ok(UdpSocket(tokio::net::UdpSocket::from_std(socket)?))
     }
