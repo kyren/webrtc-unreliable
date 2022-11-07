@@ -60,6 +60,8 @@ impl crate::runtime::Runtime for Runtime {
     }
 }
 
+pub type Server = crate::server::Server<Runtime>;
+
 pub async fn new_server(
     listen_addr: SocketAddr,
     public_addr: SocketAddr,
