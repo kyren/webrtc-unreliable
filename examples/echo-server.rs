@@ -6,13 +6,11 @@ use hyper::{
     Body, Error, Method, Response, StatusCode,
 };
 
-use webrtc_unreliable::Server as RtcServer;
-
 #[tokio::main]
 async fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("debug"));
 
-    let matches = Command::new("echo_server")
+    let matches = Command::new("echo-server")
         .arg(
             Arg::new("data")
                 .short('d')
@@ -57,9 +55,10 @@ async fn main() {
         .parse()
         .expect("could not parse HTTP address/port");
 
-    let mut rtc_server = RtcServer::new(webrtc_listen_addr, public_webrtc_addr)
-        .await
-        .expect("could not start RTC server");
+    let mut rtc_server =
+        webrtc_unreliable::tokio::new_server(webrtc_listen_addr, public_webrtc_addr)
+            .await
+            .expect("could not start RTC server");
 
     let session_endpoint = rtc_server.session_endpoint();
     let make_svc = make_service_fn(move |addr_stream: &AddrStream| {
@@ -73,7 +72,7 @@ async fn main() {
                         || req.uri().path() == "/index.html" && req.method() == Method::GET
                     {
                         log::info!("serving example index HTML to {}", remote_addr);
-                        Response::builder().body(Body::from(include_str!("./echo_server.html")))
+                        Response::builder().body(Body::from(include_str!("./echo-server.html")))
                     } else if req.uri().path() == "/new_rtc_session" && req.method() == Method::POST
                     {
                         log::info!("WebRTC session request from {}", remote_addr);

@@ -3,17 +3,19 @@ use std::{
     convert::AsRef,
     error::Error,
     fmt,
+    future::Future,
     io::{Error as IoError, ErrorKind as IoErrorKind},
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     ops::Deref,
+    pin::Pin,
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
-use async_io::Async;
 use futures_channel::mpsc;
 use futures_core::Stream;
-use futures_util::{pin_mut, select, FutureExt, SinkExt, StreamExt};
+use futures_util::{future::poll_fn, ready, select, FutureExt, SinkExt, StreamExt};
 use http::{header, Response};
 use openssl::ssl::SslAcceptor;
 use rand::thread_rng;
@@ -22,7 +24,7 @@ use crate::{
     buffer_pool::{BufferHandle, BufferPool, OwnedBuffer},
     client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
     crypto::Crypto,
-    interval::Interval,
+    runtime::{Runtime, UdpSocket},
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
     stun::{parse_stun_binding_request, write_stun_success_response},
     util::rand_string,
@@ -195,8 +197,9 @@ impl SessionEndpoint {
     }
 }
 
-pub struct Server {
-    udp_socket: Async<UdpSocket>,
+pub struct Server<R: Runtime> {
+    runtime: R,
+    udp_socket: R::UdpSocket,
     session_endpoint: SessionEndpoint,
     incoming_session_stream: mpsc::Receiver<IncomingSession>,
     ssl_acceptor: SslAcceptor,
@@ -207,20 +210,24 @@ pub struct Server {
     clients: HashMap<SocketAddr, Client>,
     last_generate_periodic: Instant,
     last_cleanup: Instant,
-    periodic_timer: Interval,
+    periodic_timer: Pin<Box<R::Timer>>,
 }
 
-impl Server {
+impl<R: Runtime> Server<R> {
     /// Start a new WebRTC data channel server listening on `listen_addr` and advertising its
     /// publicly available address as `public_addr`.
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
     /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
-    pub async fn new(listen_addr: SocketAddr, public_addr: SocketAddr) -> Result<Server, IoError> {
+    pub async fn new(
+        runtime: R,
+        listen_addr: SocketAddr,
+        public_addr: SocketAddr,
+    ) -> Result<Self, IoError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 
         let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
-        let udp_socket = Async::new(UdpSocket::bind(&listen_addr)?)?;
+        let udp_socket = runtime.bind_udp(listen_addr)?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
 
@@ -236,7 +243,10 @@ impl Server {
             session_sender,
         };
 
+        let periodic_timer = Box::pin(runtime.timer(PERIODIC_TIMER_INTERVAL));
+
         Ok(Server {
+            runtime,
             udp_socket,
             session_endpoint,
             incoming_session_stream: session_receiver,
@@ -248,7 +258,7 @@ impl Server {
             clients: HashMap::new(),
             last_generate_periodic: Instant::now(),
             last_cleanup: Instant::now(),
-            periodic_timer: Interval::new(PERIODIC_TIMER_INTERVAL),
+            periodic_timer,
         })
     }
 
@@ -390,11 +400,22 @@ impl Server {
         let mut packet_buffer = self.buffer_pool.acquire();
         packet_buffer.resize(MAX_UDP_PAYLOAD_SIZE, 0);
         let next = {
-            let recv_udp = self.udp_socket.recv_from(&mut packet_buffer).fuse();
-            pin_mut!(recv_udp);
+            let recv_udp = {
+                let udp_socket = &mut self.udp_socket;
+                let packet_buffer = &mut packet_buffer;
+                poll_fn(move |cx| udp_socket.poll_recv_from(cx, packet_buffer)).fuse()
+            };
 
-            let timer_next = self.periodic_timer.next().fuse();
-            pin_mut!(timer_next);
+            let next_timer = {
+                let runtime = &self.runtime;
+                let periodic_timer = &mut self.periodic_timer;
+                poll_fn(move |cx| {
+                    ready!(periodic_timer.as_mut().poll(cx));
+                    periodic_timer.set(runtime.timer(PERIODIC_TIMER_INTERVAL));
+                    Poll::Ready(())
+                })
+                .fuse()
+            };
 
             select! {
                 incoming_session = self.incoming_session_stream.next() => {
@@ -402,11 +423,11 @@ impl Server {
                         incoming_session.expect("connection to SessionEndpoint has closed")
                     )
                 }
-                res = recv_udp => {
+                res = { recv_udp } => {
                     let (len, remote_addr) = res?;
                     Next::IncomingPacket(len, remote_addr)
                 }
-                _ = timer_next => {
+                _ = { next_timer } => {
                     Next::PeriodicTimer
                 }
             }
@@ -444,7 +465,12 @@ impl Server {
     async fn send_outgoing(&mut self) -> Result<(), IoError> {
         while let Some((packet, remote_addr)) = self.outgoing_udp.pop_front() {
             let packet = self.buffer_pool.adopt(packet);
-            let len = self.udp_socket.send_to(&packet, remote_addr).await?;
+            let len = poll_fn({
+                let udp_socket = &mut self.udp_socket;
+                let packet = &packet;
+                move |cx| udp_socket.poll_send_to(cx, packet, remote_addr)
+            })
+            .await?;
             let packet_len = packet.len();
             if len != packet_len {
                 return Err(IoError::new(
