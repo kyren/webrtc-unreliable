@@ -40,7 +40,7 @@ implementation is provided with activation of the `tokio` feature.
 In a terminal: 
 
 ```
-$ cargo run --features tokio --example echo_server -- --data 127.0.0.1:42424 --http 127.0.0.1:8080 --public 127.0.0.1:42424
+$ cargo run --features tokio --example echo-server -- --data 127.0.0.1:42424 --http 127.0.0.1:8080 --public 127.0.0.1:42424
 ```
 
 Then, using a web browser, go to 'http://127.0.0.1:8080/index.html'. Open the

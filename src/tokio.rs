@@ -50,9 +50,9 @@ impl crate::runtime::Runtime for Runtime {
     type UdpSocket = UdpSocket;
 
     fn bind_udp(&self, listen_addr: SocketAddr) -> Result<UdpSocket, io::Error> {
-        Ok(UdpSocket(tokio::net::UdpSocket::from_std(
-            std::net::UdpSocket::bind(listen_addr)?.into(),
-        )?))
+        let socket =  std::net::UdpSocket::bind(listen_addr)?;
+        socket.set_nonblocking(true)?;
+        Ok(UdpSocket(tokio::net::UdpSocket::from_std(socket)?))
     }
 
     fn timer(&self, after: Duration) -> Timer {
