@@ -9,6 +9,7 @@ mod stun;
 mod util;
 
 pub use client::{MessageType, MAX_MESSAGE_LEN};
+pub use crypto::Crypto;
 pub use server::{MessageBuffer, MessageResult, SendError, Server, SessionEndpoint};
 
 #[cfg(feature = "tokio")]

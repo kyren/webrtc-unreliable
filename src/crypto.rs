@@ -1,21 +1,20 @@
-use std::fmt::Write as _;
+use std::{fmt::Write as _, sync::Arc};
 
 use openssl::{
     asn1::Asn1Time,
     error::ErrorStack,
     hash::MessageDigest,
     nid::Nid,
-    pkey::{PKey, Private},
+    pkey::PKey,
     rsa::Rsa,
     ssl::{SslAcceptor, SslMethod, SslVerifyMode},
     x509::{X509NameBuilder, X509},
 };
 
+#[derive(Clone)]
 pub struct Crypto {
-    pub key: PKey<Private>,
-    pub x509: X509,
-    pub fingerprint: String,
-    pub ssl_acceptor: SslAcceptor,
+    pub(crate) fingerprint: String,
+    pub(crate) ssl_acceptor: Arc<SslAcceptor>,
 }
 
 impl Crypto {
@@ -72,11 +71,9 @@ impl Crypto {
 
         ssl_acceptor_builder.set_private_key(&key)?;
         ssl_acceptor_builder.set_certificate(&x509)?;
-        let ssl_acceptor = ssl_acceptor_builder.build();
+        let ssl_acceptor = Arc::new(ssl_acceptor_builder.build());
 
         Ok(Crypto {
-            key,
-            x509,
             fingerprint,
             ssl_acceptor,
         })
