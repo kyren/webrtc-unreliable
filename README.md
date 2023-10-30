@@ -2,7 +2,7 @@
 
 ---
 
-[![Build Status](https://img.shields.io/circleci/project/github/triplehex/webrtc-unreliable.svg)](https://circleci.com/gh/triplehex/webrtc-unreliable)
+[![Build Status](https://img.shields.io/circleci/project/github/kyren/webrtc-unreliable.svg)](https://circleci.com/gh/kyren/webrtc-unreliable)
 [![Latest Version](https://img.shields.io/crates/v/webrtc-unreliable.svg)](https://crates.io/crates/webrtc-unreliable)
 [![API Documentation](https://docs.rs/webrtc-unreliable/badge.svg)](https://docs.rs/webrtc-unreliable)
 
