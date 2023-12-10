@@ -202,7 +202,7 @@ pub struct Server<R: Runtime> {
     udp_socket: R::UdpSocket,
     session_endpoint: SessionEndpoint,
     incoming_session_stream: mpsc::Receiver<IncomingSession>,
-    ssl_acceptor: SslAcceptor,
+    ssl_acceptor: Arc<SslAcceptor>,
     outgoing_udp: VecDeque<(OwnedBuffer, SocketAddr)>,
     incoming_rtc: VecDeque<(OwnedBuffer, SocketAddr, MessageType)>,
     buffer_pool: BufferPool,
@@ -224,9 +224,23 @@ impl<R: Runtime> Server<R> {
         listen_addr: SocketAddr,
         public_addr: SocketAddr,
     ) -> Result<Self, IoError> {
+        Server::with_crypto(
+            runtime,
+            listen_addr,
+            public_addr,
+            Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives"),
+        )
+        .await
+    }
+
+    pub async fn with_crypto(
+        runtime: R,
+        listen_addr: SocketAddr,
+        public_addr: SocketAddr,
+        crypto: Crypto,
+    ) -> Result<Self, IoError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 
-        let crypto = Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives");
         let udp_socket = runtime.bind_udp(listen_addr)?;
 
         let (session_sender, session_receiver) = mpsc::channel(SESSION_BUFFER_SIZE);
