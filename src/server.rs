@@ -23,7 +23,7 @@ use rand::thread_rng;
 use crate::{
     buffer_pool::{BufferHandle, BufferPool, OwnedBuffer},
     client::{Client, ClientError, MessageType, MAX_UDP_PAYLOAD_SIZE},
-    crypto::Crypto,
+    crypto::SslConfig,
     runtime::{Runtime, UdpSocket},
     sdp::{gen_sdp_response, parse_sdp_fields, SdpFields},
     stun::{parse_stun_binding_request, write_stun_success_response},
@@ -123,12 +123,14 @@ pub struct SessionEndpoint {
 
 impl SessionEndpoint {
     /// Receives an incoming SDP descriptor of an `RTCSessionDescription` from a browser, informs
-    /// the corresponding `Server` of the new WebRTC session, and returns a JSON object containing
-    /// objects which can construct an `RTCSessionDescription` and an `RTCIceCandidate` in a
-    /// browser.
+    /// the corresponding `Server` of the new WebRTC session, and returns a JSON object
+    /// containing two fields:
+    ///   1) An `answer` field which is an SDP descriptor that can be used to construct an
+    ///      `RTCSessionDescription`.
+    ///   2) a `candidate` field which is a configuration object for an `RTCIceCandidate`.
     ///
-    /// The returned JSON object contains a digest of the x509 certificate the server will use for
-    /// DTLS, and the browser will ensure that this digest matches before starting a WebRTC
+    /// The returned SDP descriptor contains a digest of the x509 certificate the server will use
+    /// for DTLS, and the browser will ensure that this digest matches before starting a WebRTC
     /// connection.
     pub async fn session_request<I, E, S>(
         &mut self,
@@ -224,20 +226,25 @@ impl<R: Runtime> Server<R> {
         listen_addr: SocketAddr,
         public_addr: SocketAddr,
     ) -> Result<Self, IoError> {
-        Server::with_crypto(
+        Server::with_ssl_config(
             runtime,
             listen_addr,
             public_addr,
-            Crypto::init().expect("WebRTC server could not initialize OpenSSL primitives"),
+            SslConfig::create().expect("WebRTC server could not initialize OpenSSL primitives"),
         )
         .await
     }
 
-    pub async fn with_crypto(
+    /// Start a new WebRTC data channel server with the given `SslConfig`.
+    ///
+    /// This can be used to share self-signed TLS certificates between different `Server` instances,
+    /// which is important in certain browsers (Firefox) when connecting to multiple WebRTC
+    /// endpoints from the same page.
+    pub async fn with_ssl_config(
         runtime: R,
         listen_addr: SocketAddr,
         public_addr: SocketAddr,
-        crypto: Crypto,
+        crypto: SslConfig,
     ) -> Result<Self, IoError> {
         const SESSION_BUFFER_SIZE: usize = 8;
 

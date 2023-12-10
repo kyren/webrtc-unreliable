@@ -11,14 +11,26 @@ use openssl::{
     x509::{X509NameBuilder, X509},
 };
 
+/// A TLS private / public key pair and certificate.
 #[derive(Clone)]
-pub struct Crypto {
+pub struct SslConfig {
     pub(crate) fingerprint: String,
     pub(crate) ssl_acceptor: Arc<SslAcceptor>,
 }
 
-impl Crypto {
-    pub fn init() -> Result<Crypto, ErrorStack> {
+impl SslConfig {
+    /// Generates an anonymous private / public key pair and self-signed certificate.
+    ///
+    /// The certificate can be self-signed because the trust in the `webrtc-unreliable` server comes
+    /// form the certificate fingerprint embedded in the session response. If the session response
+    /// descriptor is deliviered over a trusted channel (such as HTTPS with a valid server
+    /// certificate), the client will verify that the self-signed certificate matches
+    /// the fingerprint, and so the resulting DTLS connection will have the same level of
+    /// authentication.
+    ///
+    /// Client connections are assumed to be anonymous and are unverified, authentication can be
+    /// handled through the resulting WebRTC data channel.
+    pub fn create() -> Result<SslConfig, ErrorStack> {
         const X509_DAYS_NOT_BEFORE: u32 = 0;
         const X509_DAYS_NOT_AFTER: u32 = 365;
 
@@ -73,7 +85,7 @@ impl Crypto {
         ssl_acceptor_builder.set_certificate(&x509)?;
         let ssl_acceptor = Arc::new(ssl_acceptor_builder.build());
 
-        Ok(Crypto {
+        Ok(SslConfig {
             fingerprint,
             ssl_acceptor,
         })
