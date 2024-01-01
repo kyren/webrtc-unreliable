@@ -62,9 +62,9 @@ impl crate::runtime::Runtime for Runtime {
 
 pub type Server = crate::server::Server<Runtime>;
 
-pub async fn new_server(
+pub fn new_server(
     listen_addr: SocketAddr,
     public_addr: SocketAddr,
 ) -> Result<crate::server::Server<Runtime>, io::Error> {
-    crate::server::Server::new(Runtime, listen_addr, public_addr).await
+    crate::server::Server::new(Runtime, listen_addr, public_addr)
 }

@@ -221,7 +221,7 @@ impl<R: Runtime> Server<R> {
     ///
     /// WebRTC connections must be started via an external communication channel from a browser via
     /// the `SessionEndpoint`, after which a WebRTC data channel can be opened.
-    pub async fn new(
+    pub fn new(
         runtime: R,
         listen_addr: SocketAddr,
         public_addr: SocketAddr,
@@ -232,7 +232,6 @@ impl<R: Runtime> Server<R> {
             public_addr,
             SslConfig::create().expect("WebRTC server could not initialize OpenSSL primitives"),
         )
-        .await
     }
 
     /// Start a new WebRTC data channel server with the given `SslConfig`.
@@ -240,7 +239,7 @@ impl<R: Runtime> Server<R> {
     /// This can be used to share self-signed TLS certificates between different `Server` instances,
     /// which is important in certain browsers (Firefox) when connecting to multiple WebRTC
     /// endpoints from the same page.
-    pub async fn with_ssl_config(
+    pub fn with_ssl_config(
         runtime: R,
         listen_addr: SocketAddr,
         public_addr: SocketAddr,

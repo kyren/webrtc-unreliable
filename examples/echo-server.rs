@@ -57,7 +57,6 @@ async fn main() {
 
     let mut rtc_server =
         webrtc_unreliable::tokio::new_server(webrtc_listen_addr, public_webrtc_addr)
-            .await
             .expect("could not start RTC server");
 
     let session_endpoint = rtc_server.session_endpoint();
