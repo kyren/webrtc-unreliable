@@ -29,7 +29,7 @@
 - Remove crc32fast in favor of only using crc dependency.
 - Handle better clients which have errored and are shutting down without
   spamming log warnings.
-- Dont' deliver incoming messages in fragmented SCTP packets as whole messages,
+- Don't deliver incoming messages in fragmented SCTP packets as whole messages,
   we do not support fragmented SCTP at all yet.
 - API incompatible change: Simplify the API for receiving messages, returning a
   borrowed buffer for incoming messages, eliminating both `RecvError` and a
