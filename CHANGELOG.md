@@ -1,3 +1,10 @@
+## [0.6.0]
+- Support a shared `Crypto` instance between servers, useful on Firefox for
+  multiple connections per page.
+- API incompatible change: Make `Server::new` sync.
+- API incompatible change: Add `Runtime` trait to be reactor agnostic, adds an optional `tokio` feature
+  to provide the previous tokio implementation.
+
 ## [0.5.3]
 - Handle FORWARD_TSN support in SCTP when it is specified as an extension
 
