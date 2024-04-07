@@ -68,7 +68,7 @@ pub enum SessionError {
     /// `SessionEndpoint` has beeen disconnected from its `Server` (the `Server` has been dropped).
     Disconnected,
     /// An error streaming the SDP descriptor
-    StreamError(Box<dyn Error + Send + Sync + 'static>),
+    StreamError(Box<dyn Error + Send + Sync>),
 }
 
 impl fmt::Display for SessionError {
@@ -138,7 +138,7 @@ impl SessionEndpoint {
     ) -> Result<String, SessionError>
     where
         I: AsRef<[u8]>,
-        E: Error + Send + Sync + 'static,
+        E: Into<Box<dyn Error + Send + Sync>>,
         S: Stream<Item = Result<I, E>>,
     {
         const SERVER_USER_LEN: usize = 12;
@@ -188,7 +188,7 @@ impl SessionEndpoint {
     ) -> Result<Response<String>, SessionError>
     where
         I: AsRef<[u8]>,
-        E: Error + Send + Sync + 'static,
+        E: Into<Box<dyn Error + Send + Sync>>,
         S: Stream<Item = Result<I, E>>,
     {
         let r = self.session_request(sdp_descriptor).await?;

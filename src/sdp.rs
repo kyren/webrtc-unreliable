@@ -16,7 +16,7 @@ pub struct SdpFields {
 pub async fn parse_sdp_fields<I, E, S>(body: S) -> Result<SdpFields, Error>
 where
     I: AsRef<[u8]>,
-    E: error::Error + Send + Sync + 'static,
+    E: Into<Error>,
     S: Stream<Item = Result<I, E>>,
 {
     const MAX_SDP_LINE: usize = 512;
@@ -38,7 +38,7 @@ where
 
     pin_mut!(body);
     while let Some(res) = body.next().await {
-        let chunk = res?;
+        let chunk = res.map_err(Into::into)?;
         for &c in chunk.as_ref() {
             if c == b'\r' || c == b'\n' {
                 if !line_buf.is_empty() {
