@@ -16,7 +16,7 @@ crc = "3.0"
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-util = { version = "0.3", features = ["sink"] }
-http = "0.2"
+http = "1.0"
 log = "0.4"
 openssl = "0.10"
 pin-project = "1.0"
