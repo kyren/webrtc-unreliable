@@ -1,7 +1,16 @@
 use std::{fmt::Write as _, sync::Arc};
 
 use openssl::{
-    asn1::Asn1Time, bn::BigNum, bn::MsbOption, error::ErrorStack, hash::MessageDigest, nid::Nid, pkey::PKey, rsa::Rsa, ssl::{SslAcceptor, SslMethod, SslVerifyMode}, x509::{X509NameBuilder, X509}
+    asn1::Asn1Time,
+    bn::BigNum,
+    bn::MsbOption,
+    error::ErrorStack,
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::PKey,
+    rsa::Rsa,
+    ssl::{SslAcceptor, SslMethod, SslVerifyMode},
+    x509::{X509NameBuilder, X509}
 };
 
 /// A TLS private / public key pair and certificate.
