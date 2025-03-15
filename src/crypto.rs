@@ -2,6 +2,8 @@ use std::{fmt::Write as _, sync::Arc};
 
 use openssl::{
     asn1::Asn1Time,
+    bn::BigNum,
+    bn::MsbOption,
     error::ErrorStack,
     hash::MessageDigest,
     nid::Nid,
@@ -50,6 +52,9 @@ impl SslConfig {
         x509_builder.set_version(2)?;
         x509_builder.set_subject_name(&name)?;
         x509_builder.set_issuer_name(&name)?;
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+        x509_builder.set_serial_number(&serial.to_asn1_integer().unwrap())?;
         let not_before = Asn1Time::days_from_now(X509_DAYS_NOT_BEFORE)?;
         let not_after = Asn1Time::days_from_now(X509_DAYS_NOT_AFTER)?;
         x509_builder.set_not_before(&not_before)?;
