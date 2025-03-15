@@ -10,7 +10,7 @@ use openssl::{
     pkey::PKey,
     rsa::Rsa,
     ssl::{SslAcceptor, SslMethod, SslVerifyMode},
-    x509::{X509NameBuilder, X509}
+    x509::{X509NameBuilder, X509},
 };
 
 /// A TLS private / public key pair and certificate.
